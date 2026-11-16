@@ -34,10 +34,22 @@ import sys
 with open(sys.argv[1]) as handle:
     apng, gif = json.load(handle)
 source = [0.05, 0.2, 0.5, 0.1]
+
+
+def same(delays, wanted):
+    return len(delays) == len(wanted) and all(
+        delay is not None and abs(delay - want) < 0.011 for delay, want in zip(delays, wanted))
+
+
 for label, facts in (("APNG", apng), ("GIF", gif)):
     delays = [frame.get("unclampedDelay", frame.get("delay")) for frame in facts["frames"]]
-    kept = len(delays) == len(source) and all(
-        delay is not None and abs(delay - want) < 0.011 for delay, want in zip(delays, source))
+    if same(delays, source):
+        verdict = "kept"
+    elif same(delays[:-1], source[:-1]):
+        # ImageIO plays the last frame of a sequence for as long as the one before it.
+        verdict = "kept, except the last frame, which plays as long as the one before it"
+    else:
+        verdict = "NOT kept"
     print("StickerHack {}: frames={} delays={} source={} -> timing {}".format(
-        label, facts["frameCount"], delays, source, "kept" if kept else "NOT kept"))
+        label, facts["frameCount"], delays, source, verdict))
 PYTHON

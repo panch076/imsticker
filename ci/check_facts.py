@@ -94,6 +94,21 @@ def check_frames(report, where, facts, want_frames, size):
             report.check(spot, "delay {}s".format(want["delay"]), ok, delay)
 
 
+def as_written(frames):
+    """The frames the encoder writes for these source frames.
+
+    A sequence written by ImageIO plays its last frame for as long as the one
+    before it. Where those two delays differ, the encoder writes the last
+    picture twice at half its delay each, so the picture is still on screen for
+    the time the source asked for.
+    """
+    frames = [dict(frame) for frame in frames]
+    if len(frames) >= 2 and abs(frames[-1]["delay"] - frames[-2]["delay"]) > 0.0005:
+        frames[-1]["delay"] = max(frames[-1]["delay"] / 2.0, 0.005)
+        frames.append(dict(frames[-1]))
+    return frames
+
+
 def parse_import(text):
     """'2=anim.gif:768:noup' -> (2, 'anim.gif', 768, False)"""
     number, rest = text.split("=", 1)
@@ -152,9 +167,10 @@ def main():
             if facts:
                 report.check(filename, "is an HEIF sequence", facts["type"] == "public.heics", facts["type"])
                 report.check(filename, "loops forever", facts.get("loopCount") == 0, facts.get("loopCount"))
-                check_frames(report, filename, facts, want_frames, size)
-                print("{}: {}x{}, delays {}".format(
-                    filename, size[0], size[1], [frame_delay(frame) for frame in facts["frames"]]))
+                check_frames(report, filename, facts, as_written(want_frames), size)
+                print("{}: {}x{}, source delays {} -> stored delays {}".format(
+                    filename, size[0], size[1], [frame["delay"] for frame in want_frames],
+                    [frame_delay(frame) for frame in facts["frames"]]))
     extra = sorted(set(exported) - expected_files)
     report.check("export", "holds nothing unexpected", not extra, extra)
 

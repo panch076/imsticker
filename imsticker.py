@@ -5,9 +5,12 @@ The image goes in exactly as it is: no subject lift, no cut-out. Animated GIF
 and APNG files become animated stickers and keep their transparency and their
 frame timing.
 
-It works by writing rows straight into the Core Data store that `stickersd`
-keeps on a Mac (see README.md for the format). Needs macOS 14 or later, signed
-in to iMessage, with Apple's command line tools installed (`python3`, `swift`).
+It works by adding to the Core Data store that `stickersd` keeps on a Mac (see
+README.md for the format). By default the stickers are saved through Core Data
+with the model Apple ships on the Mac, so the change lands in the store's
+history, which is what iCloud sync reads. `--raw-sql` writes the rows directly
+instead. Needs macOS 14 or later, signed in to iMessage, with Apple's command
+line tools installed (`python3`, `swift`).
 
     python3 imsticker.py add cat.png party.gif wave.apng
     python3 imsticker.py list -v
@@ -41,6 +44,9 @@ DB_CANDIDATES = (
     ("Library", "Stickers", "stickers.stickerdb"),
 )
 BACKUP_PARTS = ("Library", "Application Support", "imsticker", "Backups")
+
+# The compiled Core Data model of the sticker store, shipped inside macOS.
+APPLE_MODEL = "/System/Library/PrivateFrameworks/Stickers.framework/Versions/A/Resources/Stickers.momd"
 
 STICKER_TABLE = "ZMANAGEDSTICKER"
 REP_TABLE = "ZMANAGEDREPRESENTATION"
@@ -361,25 +367,31 @@ def insert_sticker(conn, plan, encoded, name, now):
 
 
 # --------------------------------------------------------------------------
-# Encoding (Apple's ImageIO, driven through a small Swift script)
+# The Swift helper: encodes with Apple's ImageIO, saves with Apple's Core Data
 # --------------------------------------------------------------------------
 
-def encoder_command(work_dir):
-    override = os.environ.get("IMSTICKER_ENCODER")  # a JSON argv list; used by the tests
-    if override:
-        return json.loads(override)
+def require_mac():
+    if os.environ.get("IMSTICKER_ENCODER"):  # the tests bring their own helper
+        return
     if sys.platform != "darwin":
         raise ToolError(
             "Importing needs a Mac: the images are written with Apple's ImageIO and "
             "the sticker library lives in the Mac's user folder."
         )
+
+
+def helper_command(work_dir):
+    override = os.environ.get("IMSTICKER_ENCODER")  # a JSON argv list; used by the tests
+    if override:
+        return json.loads(override)
+    require_mac()
     if not shutil.which("swift"):
         raise ToolError("`swift` was not found. Install Apple's command line tools: xcode-select --install")
-    script = Path(work_dir) / "imsticker_encoder.swift"
-    script.write_text(SWIFT_ENCODER, encoding="utf-8")
+    script = Path(work_dir) / "imsticker_helper.swift"
+    script.write_text(SWIFT_HELPER, encoding="utf-8")
     # Building it once is far quicker than interpreting the script per image.
     # If the build does not work here, fall back to interpreting.
-    binary = Path(work_dir) / "imsticker_encoder"
+    binary = Path(work_dir) / "imsticker_helper"
     if shutil.which("swiftc"):
         try:
             built = subprocess.run(
@@ -391,7 +403,48 @@ def encoder_command(work_dir):
     return ["swift", str(script)]
 
 
-def _encoder_failure(proc):
+def apple_model():
+    """Where Apple's model of the sticker store is, or why it cannot be used."""
+    path = Path(os.environ.get("IMSTICKER_MODEL") or APPLE_MODEL)
+    if not path.exists():
+        raise ToolError(
+            "Apple's sticker model was not found at {}.\n"
+            "It is what lets the stickers be saved through Core Data. Without it you can "
+            "still import with --raw-sql, which writes the rows directly; those may not "
+            "reach iCloud on their own.".format(path)
+        )
+    return path
+
+
+def core_data_insert(command, db_path, model_path, stickers, work_dir):
+    """Save stickers through Core Data, in one transaction. With an empty list
+    this only checks that Apple's model opens the store."""
+    manifest_path = Path(work_dir) / "manifest-{}.json".format(len(stickers))
+    manifest_path.write_text(json.dumps({"stickers": stickers}), encoding="utf-8")
+    args = list(command) + [
+        "insert", "--store", str(db_path), "--model", str(model_path), "--manifest", str(manifest_path),
+    ]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True)
+    except OSError as exc:
+        raise ToolError("could not run the helper: {}".format(exc))
+    if proc.returncode != 0:
+        raise ToolError(
+            "{}\nNothing was changed. If Apple's model does not fit this library, "
+            "--raw-sql writes the rows directly instead.".format(_encoder_failure(proc, "Core Data save failed"))
+        )
+    try:
+        saved = json.loads(proc.stdout)["stickers"]
+        for item in saved:
+            item["primaryKey"], item["uri"]
+    except (ValueError, KeyError, TypeError):
+        raise ToolError("the helper printed something unexpected: {}".format(proc.stdout.strip()[:200]))
+    if len(saved) != len(stickers):
+        raise ToolError("the helper saved {} stickers, expected {}".format(len(saved), len(stickers)))
+    return saved
+
+
+def _encoder_failure(proc, what="encoder failed"):
     detail = (proc.stderr or proc.stdout or "").strip() or "exit {}".format(proc.returncode)
     hint = ""
     if "SwiftBridging" in detail:
@@ -403,7 +456,7 @@ def _encoder_failure(proc):
     lines = detail.splitlines()
     if len(lines) > 12:
         detail = "\n".join(lines[:12]) + "\n... ({} more lines)".format(len(lines) - 12)
-    return "encoder failed: {}{}".format(detail, hint)
+    return "{}: {}{}".format(what, detail, hint)
 
 
 def run_encoder(command, source, out_dir, max_edge, resample, no_upscale):
@@ -493,6 +546,39 @@ def describe(encoded):
 # Commands
 # --------------------------------------------------------------------------
 
+def sql_layout_check(db_path):
+    """Check the store's layout for --raw-sql. Returns the columns left alone."""
+    conn = connect(db_path)
+    try:
+        return Plan(conn).unknown
+    finally:
+        conn.close()
+
+
+def sql_insert(db_path, encoded_stickers, name):
+    """Write the rows directly, all in one transaction."""
+    conn = connect(db_path)
+    try:
+        plan = Plan(conn)
+        now = time.time() - COCOA_EPOCH
+        try:
+            conn.execute("begin immediate")
+        except sqlite3.Error as exc:
+            raise ToolError("The sticker database is busy ({}). Quit Messages and retry.".format(exc))
+        try:
+            rows = [insert_sticker(conn, plan, encoded, name, now) for encoded in encoded_stickers]
+            conn.execute("commit")
+        except Exception as exc:
+            if conn.in_transaction:
+                conn.execute("rollback")
+            if isinstance(exc, (sqlite3.Error, OSError)):
+                raise ToolError("Import failed and was rolled back: {}".format(exc))
+            raise
+        return rows
+    finally:
+        conn.close()
+
+
 def cmd_add(args):
     files = [Path(item).expanduser() for item in args.files]
     missing = [str(path) for path in files if not path.is_file()]
@@ -502,17 +588,24 @@ def cmd_add(args):
         raise ToolError("--name names one sticker; pass a single file with it")
 
     db_path = find_db(args.db)
-    conn = connect(db_path)
     work_dir = Path(tempfile.mkdtemp(prefix="imsticker-"))
     failures = []
     try:
-        plan = Plan(conn)
         print("Sticker library: {}".format(db_path))
-        if plan.unknown:
-            print("note: leaving columns new to this tool at their defaults: {}".format(
-                ", ".join(plan.unknown)))
+        require_mac()
+        # Find out whether the library can be written before spending time encoding.
+        model = None
+        if args.raw_sql:
+            unknown = sql_layout_check(db_path)
+            if unknown:
+                print("note: leaving columns new to this tool at their defaults: {}".format(
+                    ", ".join(unknown)))
+        else:
+            model = apple_model()
+        command = helper_command(work_dir)
+        if model is not None:
+            core_data_insert(command, db_path, model, [], work_dir)
 
-        command = encoder_command(work_dir)
         ready = []
         for position, source in enumerate(files):
             try:
@@ -534,25 +627,22 @@ def cmd_add(args):
             return 1 if failures else 0
 
         backup = backup_db(db_path, backup_dir())
-        now = time.time() - COCOA_EPOCH
-        try:
-            conn.execute("begin immediate")
-        except sqlite3.Error as exc:
-            raise ToolError("The sticker database is busy ({}). Quit Messages and retry.".format(exc))
-        try:
-            added = [
-                (source, encoded, insert_sticker(conn, plan, encoded, args.name, now))
-                for source, encoded in ready
-            ]
-            conn.execute("commit")
-        except Exception as exc:
-            if conn.in_transaction:
-                conn.execute("rollback")
-            if isinstance(exc, (sqlite3.Error, OSError)):
-                raise ToolError("Import failed and was rolled back: {}".format(exc))
-            raise
+        if model is None:
+            rows = sql_insert(db_path, [encoded for _, encoded in ready], args.name)
+        else:
+            saved = core_data_insert(command, db_path, model, [
+                {
+                    "searchText": args.name,
+                    "representations": [
+                        dict((field, rep[field]) for field in REP_FIELDS)
+                        for rep in encoded["representations"]
+                    ],
+                }
+                for _, encoded in ready
+            ], work_dir)
+            rows = [{"pk": item["primaryKey"], "uri": item["uri"]} for item in saved]
+        added = [(source, encoded, row) for (source, encoded), row in zip(ready, rows)]
     finally:
-        conn.close()
         shutil.rmtree(str(work_dir), ignore_errors=True)
 
     for source, encoded, row in added:
@@ -731,6 +821,10 @@ def build_parser():
     add.add_argument("--no-upscale", action="store_true", help="never enlarge small images")
     add.add_argument("--resample", choices=("auto", "nearest", "smooth"), default="auto",
                      help="nearest keeps pixel art crisp (default: auto)")
+    add.add_argument("--raw-sql", action="store_true",
+                     help="write the database rows directly instead of saving through Core Data "
+                          "(works without Apple's model, but the change is not recorded in the "
+                          "store's history, which iCloud sync reads)")
     add.add_argument("--no-restart", action="store_true", help="do not restart stickersd afterwards")
     add.add_argument("--dry-run", action="store_true", help="encode and check, but change nothing")
     add.set_defaults(run=cmd_add)
@@ -787,13 +881,20 @@ def main(argv=None):
         return 1
 
 
-# The encoder. It decodes with ImageIO (which already composites GIF and APNG
+# The helper, in Swift because both jobs need Apple's frameworks.
+#
+# Encoding: it decodes with ImageIO (which already composites GIF and APNG
 # frames), draws each frame untouched into an RGBA canvas, and writes HEIC for
 # stills or an HEIF image sequence for animations.
-SWIFT_ENCODER = r'''
+#
+# Saving ("insert"): it opens the sticker store with Core Data and the model
+# Apple ships, and saves the stickers as managed objects. Core Data then writes
+# the rows, the keys and the persistent history itself.
+SWIFT_HELPER = r'''
 import Foundation
 import ImageIO
 import CoreGraphics
+import CoreData
 
 struct Representation: Encodable {
     let role: String
@@ -1000,8 +1101,26 @@ func encodeAnimated(source: CGImageSource, frameCount: Int, isGIF: Bool, options
     // The sequence is HEVC video underneath, so keep both sides even.
     let width = max(2, fittedWidth - fittedWidth % 2)
     let height = max(2, fittedHeight - fittedHeight % 2)
+    // Which source frame goes where, and for how long.
+    var frames: [Int] = []
+    var delays: [Double] = []
+    for index in 0..<frameCount {
+        frames.append(index)
+        delays.append(frameDelay(source, index))
+    }
+    // An HEIF sequence written by ImageIO plays its last frame for as long as
+    // the one before it, whatever delay was asked for. Where those two differ,
+    // write the last picture twice at half its delay each: the copy then
+    // inherits the right half, and the picture is on screen for the right time.
+    if frameCount >= 2 && abs(delays[frameCount - 1] - delays[frameCount - 2]) > 0.0005 {
+        let half = max(delays[frameCount - 1] / 2, 0.005)
+        delays[frameCount - 1] = half
+        delays.append(half)
+        frames.append(frameCount - 1)
+    }
+
     let url = outputDir.appendingPathComponent("animated.heics")
-    guard let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.heics" as CFString, frameCount, nil) else {
+    guard let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.heics" as CFString, frames.count, nil) else {
         die("cannot create an HEIF image sequence writer")
     }
     let sequenceProperties: [CFString: Any] = [
@@ -1009,13 +1128,13 @@ func encodeAnimated(source: CGImageSource, frameCount: Int, isGIF: Bool, options
         kCGImageDestinationLossyCompressionQuality: 0.85
     ]
     CGImageDestinationSetProperties(destination, sequenceProperties as CFDictionary)
-    for index in 0..<frameCount {
+    for (position, index) in frames.enumerated() {
         guard let frame = CGImageSourceCreateImageAtIndex(source, index, nil) else {
             die("cannot decode frame \(index)")
         }
         let rendered = render(frame, width: width, height: height, smooth: smooth)
         let frameProperties: [CFString: Any] = [
-            kCGImagePropertyHEICSDictionary: [kCGImagePropertyHEICSDelayTime: frameDelay(source, index)],
+            kCGImagePropertyHEICSDictionary: [kCGImagePropertyHEICSDelayTime: delays[position]],
             kCGImageDestinationLossyCompressionQuality: 0.85
         ]
         CGImageDestinationAddImage(destination, rendered, frameProperties as CFDictionary)
@@ -1044,35 +1163,243 @@ func encodeAnimated(source: CGImageSource, frameCount: Int, isGIF: Bool, options
     )
 }
 
-let options = parseOptions(CommandLine.arguments)
-let inputURL = URL(fileURLWithPath: options.input)
-let outputURL = URL(fileURLWithPath: options.outputDir, isDirectory: true)
-try? FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
+func printJSON<T: Encodable>(_ value: T) {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    guard let json = try? encoder.encode(value) else {
+        die("cannot serialize the result")
+    }
+    FileHandle.standardOutput.write(json)
+    FileHandle.standardOutput.write("\n".data(using: .utf8)!)
+}
 
-guard let source = CGImageSourceCreateWithURL(inputURL as CFURL, nil) else {
-    die("cannot open image: \(options.input)")
-}
-let frameCount = CGImageSourceGetCount(source)
-if frameCount < 1 {
-    die("no image found in \(options.input)")
-}
-let output = frameCount > 1
-    ? encodeAnimated(
-        source: source,
-        frameCount: frameCount,
-        isGIF: inputURL.pathExtension.lowercased() == "gif",
-        options: options,
-        outputDir: outputURL
-    )
-    : encodeStill(source: source, options: options, outputDir: outputURL)
+func runEncode(_ arguments: [String]) -> Never {
+    let options = parseOptions(arguments)
+    let inputURL = URL(fileURLWithPath: options.input)
+    let outputURL = URL(fileURLWithPath: options.outputDir, isDirectory: true)
+    try? FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
 
-let encoder = JSONEncoder()
-encoder.outputFormatting = [.sortedKeys]
-guard let json = try? encoder.encode(output) else {
-    die("cannot serialize the result")
+    guard let source = CGImageSourceCreateWithURL(inputURL as CFURL, nil) else {
+        die("cannot open image: \(options.input)")
+    }
+    let frameCount = CGImageSourceGetCount(source)
+    if frameCount < 1 {
+        die("no image found in \(options.input)")
+    }
+    if frameCount > 1 {
+        printJSON(encodeAnimated(
+            source: source,
+            frameCount: frameCount,
+            isGIF: inputURL.pathExtension.lowercased() == "gif",
+            options: options,
+            outputDir: outputURL
+        ))
+    } else {
+        printJSON(encodeStill(source: source, options: options, outputDir: outputURL))
+    }
+    exit(0)
 }
-FileHandle.standardOutput.write(json)
-FileHandle.standardOutput.write("\n".data(using: .utf8)!)
+
+// ---- saving through Core Data ----
+
+struct ManifestRepresentation: Decodable {
+    let path: String
+    let role: String
+    let uti: String
+    let width: Double
+    let height: Double
+    let preferred: Bool
+    let index: Int
+}
+
+struct ManifestSticker: Decodable {
+    let searchText: String?
+    let representations: [ManifestRepresentation]
+}
+
+struct Manifest: Decodable {
+    let stickers: [ManifestSticker]
+}
+
+struct SavedSticker: Encodable {
+    let identifier: String
+    let uri: String
+    let primaryKey: Int
+    let libraryIndex: Double
+}
+
+struct SaveResult: Encodable {
+    let stickers: [SavedSticker]
+}
+
+struct PendingSticker {
+    let object: NSManagedObject
+    let identifier: UUID
+    let libraryIndex: Double
+}
+
+// What the Core Data callbacks report back.
+final class SaveState {
+    var loadError: Error? = nil
+    var saved: [SavedSticker] = []
+    var failure: String? = nil
+}
+
+func runInsert(_ arguments: [String]) -> Never {
+    var storePath = ""
+    var modelPath = ""
+    var manifestPath = ""
+    var mayCreate = false
+    var index = 0
+    while index < arguments.count {
+        let argument = arguments[index]
+        if argument == "--create" {
+            mayCreate = true
+            index += 1
+            continue
+        }
+        guard index + 1 < arguments.count else { die("missing value for \(argument)") }
+        let value = arguments[index + 1]
+        switch argument {
+        case "--store":
+            storePath = value
+        case "--model":
+            modelPath = value
+        case "--manifest":
+            manifestPath = value
+        default:
+            die("unknown argument: \(argument)")
+        }
+        index += 2
+    }
+    if storePath.isEmpty || modelPath.isEmpty || manifestPath.isEmpty {
+        die("insert needs --store, --model and --manifest")
+    }
+    guard let manifestData = FileManager.default.contents(atPath: manifestPath),
+          let manifest = try? JSONDecoder().decode(Manifest.self, from: manifestData) else {
+        die("cannot read the manifest at \(manifestPath)")
+    }
+    // Read every image before the store is touched.
+    var images: [[Data]] = []
+    for sticker in manifest.stickers {
+        var loaded: [Data] = []
+        for representation in sticker.representations {
+            guard let data = FileManager.default.contents(atPath: representation.path), !data.isEmpty else {
+                die("cannot read \(representation.path)")
+            }
+            loaded.append(data)
+        }
+        images.append(loaded)
+    }
+    if !mayCreate && !FileManager.default.fileExists(atPath: storePath) {
+        die("there is no sticker store at \(storePath)")
+    }
+    guard let model = NSManagedObjectModel(contentsOf: URL(fileURLWithPath: modelPath)) else {
+        die("cannot load Apple's sticker model at \(modelPath)")
+    }
+
+    let container = NSPersistentContainer(name: "Stickers", managedObjectModel: model)
+    let storeDescription = NSPersistentStoreDescription(url: URL(fileURLWithPath: storePath))
+    storeDescription.type = NSSQLiteStoreType
+    storeDescription.shouldAddStoreAsynchronously = false
+    // Never change the store's layout. If Apple's model does not fit it, stop.
+    storeDescription.shouldMigrateStoreAutomatically = false
+    storeDescription.shouldInferMappingModelAutomatically = false
+    // The store records its history; opened without this it would be read-only.
+    storeDescription.setOption(NSNumber(value: true), forKey: NSPersistentHistoryTrackingKey)
+    storeDescription.setOption(NSNumber(value: true), forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey)
+    container.persistentStoreDescriptions = [storeDescription]
+    let state = SaveState()
+    container.loadPersistentStores { _, error in
+        state.loadError = error
+    }
+    if let loadError = state.loadError {
+        die("Apple's model did not open the sticker store: \(loadError)")
+    }
+
+    let context = container.newBackgroundContext()
+    context.transactionAuthor = "imsticker"
+    context.performAndWait {
+        do {
+            let request = NSFetchRequest<NSManagedObject>(entityName: "ManagedSticker")
+            request.predicate = NSPredicate(format: "type == 1")
+            request.sortDescriptors = [NSSortDescriptor(key: "libraryIndex", ascending: false)]
+            request.fetchLimit = 1
+            var topIndex = 0.0
+            if let first = try context.fetch(request).first, let value = first.value(forKey: "libraryIndex") as? Double {
+                topIndex = value
+            }
+            let now = Date().timeIntervalSinceReferenceDate
+            var pending: [PendingSticker] = []
+            for (position, item) in manifest.stickers.enumerated() {
+                let identifier = UUID()
+                let libraryIndex = topIndex + 1024.0 * Double(position + 1)
+                var totalBytes = 0
+                for data in images[position] {
+                    totalBytes += data.count
+                }
+                let sticker = NSEntityDescription.insertNewObject(forEntityName: "ManagedSticker", into: context)
+                sticker.setValue(identifier, forKey: "identifier")
+                sticker.setValue(NSNumber(value: Int32(1)), forKey: "type")
+                sticker.setValue(NSNumber(value: Int32(0)), forKey: "effect")
+                sticker.setValue(NSNumber(value: Int32(1)), forKey: "version")
+                sticker.setValue(NSNumber(value: Int32(totalBytes)), forKey: "byteCount")
+                sticker.setValue(NSNumber(value: now), forKey: "creationDate")
+                sticker.setValue(NSNumber(value: now), forKey: "lastUsedDate")
+                sticker.setValue(NSNumber(value: libraryIndex), forKey: "libraryIndex")
+                sticker.setValue("sticker:///user/identifier/\(identifier.uuidString)", forKey: "externalURI")
+                sticker.setValue("", forKey: "name")
+                if let text = item.searchText, !text.isEmpty {
+                    sticker.setValue(text, forKey: "searchText")
+                }
+                for (slot, representation) in item.representations.enumerated() {
+                    let data = images[position][slot]
+                    let object = NSEntityDescription.insertNewObject(forEntityName: "ManagedRepresentation", into: context)
+                    object.setValue(UUID(), forKey: "identifier")
+                    object.setValue(data, forKey: "data")
+                    object.setValue(representation.uti, forKey: "uti")
+                    object.setValue(representation.role, forKey: "role")
+                    object.setValue(NSNumber(value: representation.width), forKey: "size_w")
+                    object.setValue(NSNumber(value: representation.height), forKey: "size_h")
+                    object.setValue(NSNumber(value: representation.preferred), forKey: "isPreferred")
+                    object.setValue(NSNumber(value: Int32(representation.index)), forKey: "index")
+                    object.setValue(NSNumber(value: Int32(data.count)), forKey: "byteCount")
+                    object.setValue(NSNumber(value: Int32(1)), forKey: "version")
+                    object.setValue(sticker, forKey: "sticker")
+                }
+                pending.append(PendingSticker(object: sticker, identifier: identifier, libraryIndex: libraryIndex))
+            }
+            if !pending.isEmpty {
+                try context.save()
+            }
+            for item in pending {
+                // After the save the object has its permanent key: .../ManagedSticker/p12
+                let tail = item.object.objectID.uriRepresentation().lastPathComponent
+                let key = Int(tail.dropFirst()) ?? 0
+                state.saved.append(SavedSticker(
+                    identifier: item.identifier.uuidString,
+                    uri: "sticker:///user/identifier/\(item.identifier.uuidString)",
+                    primaryKey: key,
+                    libraryIndex: item.libraryIndex
+                ))
+            }
+        } catch {
+            state.failure = "\(error)"
+            context.rollback()
+        }
+    }
+    if let failure = state.failure {
+        die("the stickers were not saved: \(failure)")
+    }
+    printJSON(SaveResult(stickers: state.saved))
+    exit(0)
+}
+
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "insert" {
+    runInsert(Array(CommandLine.arguments.dropFirst(2)))
+} else {
+    runEncode(CommandLine.arguments)
+}
 '''
 
 

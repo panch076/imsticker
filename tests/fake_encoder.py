@@ -23,8 +23,38 @@ STILLS = (
 )
 
 
+def insert(args):
+    """Stand in for the Core Data save: same command line, same JSON back. The
+    rows are written with imsticker's own SQL so the tests can look at them."""
+    options = dict(zip(args[0::2], args[1::2]))
+    if os.environ.get("FAKE_INSERT_FAIL"):
+        sys.stderr.write("Apple's model did not open the sticker store: model mismatch\n")
+        return 1
+    with open(options["--manifest"]) as handle:
+        manifest = json.load(handle)
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import imsticker
+
+    conn = imsticker.connect(options["--store"])
+    plan = imsticker.Plan(conn)
+    saved = []
+    conn.execute("begin immediate")
+    for sticker in manifest["stickers"]:
+        row = imsticker.insert_sticker(conn, plan, sticker, sticker.get("searchText"), 0.0)
+        saved.append({
+            "identifier": row["uri"].rsplit("/", 1)[-1], "uri": row["uri"],
+            "primaryKey": row["pk"], "libraryIndex": 0.0,
+        })
+    conn.execute("commit")
+    conn.close()
+    print(json.dumps({"stickers": saved}))
+    return 0
+
+
 def main():
     args = sys.argv[1:]
+    if args and args[0] == "insert":
+        return insert(args[1:])
     options = {"--no-upscale": False}
     index = 0
     while index < len(args):

@@ -27,7 +27,28 @@ SDK=$(xcrun --show-sdk-path)
 echo "sdk: $SDK"
 ls "$SDK/System/Library/Frameworks" | grep -i sticker
 ls "$SDK/System/Library/PrivateFrameworks" 2>/dev/null | grep -i sticker
-find "$SDK/System/Library/Frameworks" -maxdepth 4 -ipath "*sticker*" 2>/dev/null | head -40
+echo "--- every file the SDK has for them"
+find "$SDK/System/Library/Frameworks/StickerKit.framework/" "$SDK/System/Library/Frameworks/StickerFoundation.framework/" \
+    "$SDK/System/Library/PrivateFrameworks/Stickers.framework/" "$SDK/System/Library/PrivateFrameworks/StickerKitInternal.framework/" \
+    "$SDK/System/Library/PrivateFrameworks/StickerFoundationInternal.framework/" -type f 2>/dev/null \
+    | sed "s|$SDK||" | while IFS= read -r file; do
+        echo "$(wc -c < "$SDK$file" | tr -d ' ') bytes  $file"
+    done
+echo "--- what the SDK's headers and interfaces declare (declaration lines only)"
+find "$SDK/System/Library/Frameworks/StickerKit.framework/" "$SDK/System/Library/Frameworks/StickerFoundation.framework/" \
+    -type f \( -name "*.h" -o -name "*.swiftinterface" -o -name "*.modulemap" \) 2>/dev/null | sort | while IFS= read -r file; do
+        echo "## ${file#"$SDK"}"
+        grep -v -E "^\s*(//|/\*|\*)" "$file" \
+            | grep -E "@interface|@protocol|@property|^[-+] *\(|NS_ENUM|NS_OPTIONS|typedef|extern|FOUNDATION_EXPORT|#import|module |header |export |public |open |@objc|@available|^ *(final )?(class|struct|enum|protocol|extension|func|var|let|init|case|typealias) " \
+            | cut -c1-220 | head -200
+    done
+echo "--- what the private frameworks' link stubs export (first lines)"
+for stub in "$SDK"/System/Library/PrivateFrameworks/Stickers.framework/*.tbd "$SDK"/System/Library/PrivateFrameworks/Stickers.framework/Versions/A/*.tbd; do
+    [ -f "$stub" ] || continue
+    echo "## ${stub#"$SDK"}"
+    head -12 "$stub" | cut -c1-300
+    break
+done
 
 section "core data model"
 MODEL="$PF/Stickers.framework/Versions/A/Resources/Stickers.momd"
@@ -52,6 +73,14 @@ section "Stickers.framework: every export"
 exports "$PF/Stickers.framework/Versions/A/Stickers" | sed -E 's/^ +0x[0-9A-Fa-f]+ +//' \
     | grep -v -E "^(protocol witness|merged |outlined |lazy protocol witness|associated type witness|base witness table|method lookup function|class metadata base offset|reflection metadata|nominal type descriptor|full type metadata|type metadata for|metaclass for|protocol conformance descriptor|property descriptor|method descriptor|dispatch thunk)" \
     | cut -c1-300 | LC_ALL=C sort -u
+
+section "Stickers.framework: what its protocols require"
+exports "$PF/Stickers.framework/Versions/A/Stickers" | sed -E 's/^ +0x[0-9A-Fa-f]+ +//' \
+    | grep -E "^method descriptor for Stickers\.(StickerStoreProtocol|StickerStoreProtocolInternal|StickerStoreDataMapper|ProxyProvider)\." \
+    | sed -E 's/^method descriptor for //' | cut -c1-400 | LC_ALL=C sort -u
+echo "--- conformances"
+exports "$PF/Stickers.framework/Versions/A/Stickers" | sed -E 's/^ +0x[0-9A-Fa-f]+ +//' \
+    | grep -E "^protocol conformance descriptor for Stickers\.(StickerStore|CoreDataDataMapper|XPCDataMapper|InMemoryDataMapper) " | cut -c1-300 | LC_ALL=C sort -u
 
 for name in StickerFoundation StickerKit StickerFoundationInternal StickerKitInternal; do
     for root in "$PUB" "$PF"; do

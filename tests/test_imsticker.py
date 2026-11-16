@@ -91,19 +91,26 @@ def rows(path, sql, params=()):
 
 
 class StoreCase(unittest.TestCase):
+    # Most tests are about the rows, so they use the route that writes them
+    # with SQL. CoreDataRoute below covers the default route's own logic.
+    raw_sql = True
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
         self.db = self.dir / "stickers.stickerdb"
         self.backups = self.dir / "backups"
+        self.model = self.dir / "Stickers.momd"
+        self.model.mkdir()
         env = mock.patch.dict(os.environ, {
             "IMSTICKER_ENCODER": json.dumps([sys.executable, str(ROOT / "tests" / "fake_encoder.py")]),
             "IMSTICKER_BACKUP_DIR": str(self.backups),
+            "IMSTICKER_MODEL": str(self.model),
         })
         env.start()
         self.addCleanup(env.stop)
-        for name in ("IMSTICKER_DB", "FAKE_BAD_BRAND", "FAKE_GARBAGE"):
+        for name in ("IMSTICKER_DB", "FAKE_BAD_BRAND", "FAKE_GARBAGE", "FAKE_INSERT_FAIL"):
             os.environ.pop(name, None)
         # On a Mac the tool restarts stickersd after a change. Tests must not.
         restart = mock.patch.object(imsticker, "restart_stickersd", return_value=False)
@@ -116,9 +123,12 @@ class StoreCase(unittest.TestCase):
         return str(path)
 
     def cli(self, *argv):
+        argv = list(argv)
+        if self.raw_sql and argv[:1] == ["add"]:
+            argv.insert(1, "--raw-sql")
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = imsticker.main(["--db", str(self.db)] + list(argv))
+            code = imsticker.main(["--db", str(self.db)] + argv)
         return code, out.getvalue(), err.getvalue()
 
     def counts(self):
@@ -232,8 +242,71 @@ class AddStatic(StoreCase):
 
     def test_command_word_is_optional(self):
         make_store(self.db)
-        self.assertEqual(self.cli(self.source("cat.png"))[0], 0)
+        self.assertEqual(self.cli(self.source("cat.png"), "--raw-sql")[0], 0)
         self.assertEqual(self.counts(), (1, 7))
+
+
+class CoreDataRoute(StoreCase):
+    """The default route hands the stickers to the helper to save. Here the
+    helper is the stand-in, so this covers what imsticker itself does around it:
+    checking the library first, the manifest it sends, and what it reports."""
+
+    raw_sql = False
+
+    def test_saves_through_the_helper(self):
+        make_store(self.db)
+        code, out, err = self.cli("add", self.source("cat.png"), self.source("anim.gif"))
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("added  cat.png: static 768x768", out)
+        self.assertIn("-> sticker #1", out)
+        self.assertIn("added  anim.gif: animated 448x448", out)
+        self.assertIn("-> sticker #2", out)
+        self.assertEqual(self.counts(), (2, 8))
+        roles = [row[0] for row in rows(self.db, "select ZROLE from ZMANAGEDREPRESENTATION where ZSTICKER = 1 order by ZINDEX")]
+        self.assertEqual(roles, ROLES)
+        self.assertEqual(len(list(self.backups.glob("*.backup"))), 1)
+
+    def test_name_reaches_the_helper(self):
+        make_store(self.db)
+        self.assertEqual(self.cli("add", self.source("cat.png"), "--name", "Troll")[0], 0)
+        self.assertEqual(rows(self.db, "select ZSEARCHTEXT from ZMANAGEDSTICKER")[0][0], "Troll")
+
+    def test_library_is_checked_before_anything_is_encoded_or_backed_up(self):
+        make_store(self.db)
+        with mock.patch.dict(os.environ, {"FAKE_INSERT_FAIL": "1"}):
+            code, out, err = self.cli("add", self.source("cat.png"))
+        self.assertEqual(code, 1)
+        self.assertIn("Core Data save failed: Apple's model did not open the sticker store", err)
+        self.assertIn("Nothing was changed", err)
+        self.assertIn("--raw-sql", err)
+        self.assertEqual(self.counts(), (0, 0))
+        self.assertFalse(self.backups.exists())
+
+    def test_missing_model_points_to_the_other_route(self):
+        make_store(self.db)
+        with mock.patch.dict(os.environ, {"IMSTICKER_MODEL": str(self.dir / "nowhere.momd")}):
+            code, _, err = self.cli("add", self.source("cat.png"))
+        self.assertEqual(code, 1)
+        self.assertIn("Apple's sticker model was not found", err)
+        self.assertIn("--raw-sql", err)
+        self.assertEqual(self.counts(), (0, 0))
+
+    def test_dry_run_checks_the_library_but_changes_nothing(self):
+        make_store(self.db)
+        code, out, _ = self.cli("add", self.source("cat.png"), "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("would add  cat.png", out)
+        self.assertEqual(self.counts(), (0, 0))
+        self.assertFalse(self.backups.exists())
+
+    def test_needs_a_mac(self):
+        make_store(self.db)
+        os.environ.pop("IMSTICKER_ENCODER")
+        with mock.patch.object(imsticker.sys, "platform", "win32"):
+            code, _, err = self.cli("add", self.source("cat.png"))
+        self.assertEqual(code, 1)
+        self.assertIn("needs a Mac", err)
+        self.assertEqual(self.counts(), (0, 0))
 
 
 class AddAnimated(StoreCase):
@@ -541,7 +614,7 @@ class Portability(unittest.TestCase):
         ast.parse(source, feature_version=(3, 9))
 
     def test_embedded_swift_survives_the_python_string(self):
-        swift = imsticker.SWIFT_ENCODER
+        swift = imsticker.SWIFT_HELPER
         self.assertIn('die("missing value for \\(argument)")', swift)
         self.assertIn('(message + "\\n").data(using: .utf8)', swift)
         self.assertEqual(swift.count("{"), swift.count("}"))
