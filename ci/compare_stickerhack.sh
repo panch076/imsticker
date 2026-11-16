@@ -9,6 +9,13 @@ cd "$(dirname "$0")/.."
 WORK="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/stickerhack-compare"
 rm -rf "$WORK"
 mkdir -p "$WORK/apng" "$WORK/gif"
+
+swiftc -o "$WORK/can_write_heics" ci/can_write_heics.swift
+if ! "$WORK/can_write_heics"; then
+    echo "::warning title=StickerHack comparison skipped::This runner cannot write HEIF image sequences, so StickerHack's encoder cannot run here either."
+    exit 0
+fi
+
 COMMIT=66e728abacfc59a4bf174a328368ee351d10c854
 curl -fsSL "https://raw.githubusercontent.com/AdamEXu/StickerHack/$COMMIT/helpers/encode_sticker.swift" \
     -o "$WORK/encode_sticker.swift"

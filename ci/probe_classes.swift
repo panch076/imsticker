@@ -1,10 +1,10 @@
 // Load a system framework and print what the Objective-C runtime knows about
-// it: classes, their properties, instance variables and methods, plus the
-// string constants and Swift field names stored in the image. This is how the
-// names in README.md (roles, types, identifiers) can be checked against the
-// operating system itself.
+// it: classes with their properties, instance variables and methods (with type
+// encodings), any protocols named on the command line, and the string constants
+// and Swift field names stored in the image. This is how the names in README.md
+// (roles, types, identifiers) are checked against the operating system itself.
 //
-//     swift ci/probe_classes.swift /System/Library/PrivateFrameworks/Stickers.framework/Stickers
+//     swift ci/probe_classes.swift /System/Library/PrivateFrameworks/Stickers.framework/Stickers [protocol ...]
 
 import Foundation
 import ObjectiveC
@@ -13,9 +13,13 @@ import MachO
 let requested = CommandLine.arguments.count > 1
     ? CommandLine.arguments[1]
     : "/System/Library/PrivateFrameworks/Stickers.framework/Stickers"
+let protocolNames = Array(CommandLine.arguments.dropFirst(2))
 
 if dlopen(requested, RTLD_NOW) == nil {
-    let reason = String(cString: dlerror())
+    var reason = "unknown"
+    if let raw = dlerror() {
+        reason = String(cString: raw)
+    }
     print("dlopen failed for \(requested): \(reason)")
     exit(0)
 }
@@ -44,7 +48,11 @@ func printMethods(_ cls: AnyClass, _ prefix: String) {
     var count: UInt32 = 0
     guard let list = class_copyMethodList(cls, &count) else { return }
     for index in 0..<Int(count) {
-        print("  \(prefix) \(NSStringFromSelector(method_getName(list[index])))")
+        var encoding = ""
+        if let raw = method_getTypeEncoding(list[index]) {
+            encoding = String(cString: raw)
+        }
+        print("  \(prefix) \(NSStringFromSelector(method_getName(list[index])))  \(encoding)")
     }
     free(list)
 }
@@ -106,6 +114,37 @@ if let names = objc_copyClassNamesForImage(image, &classCount) {
     print("CLASSES none")
 }
 
+// The methods an Objective-C protocol declares, for example the one an XPC
+// service speaks.
+func printProtocol(_ name: String) {
+    guard let proto = objc_getProtocol(name) else {
+        print("PROTOCOL \(name): not registered")
+        return
+    }
+    print("PROTOCOL \(name)")
+    let kinds: [(Bool, Bool)] = [(true, true), (false, true), (true, false), (false, false)]
+    for (required, instance) in kinds {
+        var count: UInt32 = 0
+        guard let list = protocol_copyMethodDescriptionList(proto, required, instance, &count) else { continue }
+        for index in 0..<Int(count) {
+            var selector = "?"
+            if let selectorName = list[index].name {
+                selector = NSStringFromSelector(selectorName)
+            }
+            var types = ""
+            if let raw = list[index].types {
+                types = String(cString: raw)
+            }
+            print("  \(instance ? "-" : "+") \(selector)  \(types)\(required ? "" : "  (optional)")")
+        }
+        free(list)
+    }
+}
+
+for name in protocolNames {
+    printProtocol(name)
+}
+
 // NUL-separated strings of one section of the image, as loaded in memory.
 func printStrings(_ header: UnsafePointer<mach_header_64>, _ segment: String, _ section: String, limit: Int) {
     var size: UInt = 0
@@ -136,7 +175,6 @@ func printStrings(_ header: UnsafePointer<mach_header_64>, _ segment: String, _ 
 
 if let rawHeader = _dyld_get_image_header(imageSlot) {
     let header = UnsafeRawPointer(rawHeader).assumingMemoryBound(to: mach_header_64.self)
-    printStrings(header, "__TEXT", "__cstring", limit: 5000)
-    printStrings(header, "__TEXT", "__swift5_reflstr", limit: 5000)
-    printStrings(header, "__TEXT", "__swift5_typeref", limit: 0)
+    printStrings(header, "__TEXT", "__cstring", limit: 20000)
+    printStrings(header, "__TEXT", "__swift5_reflstr", limit: 20000)
 }

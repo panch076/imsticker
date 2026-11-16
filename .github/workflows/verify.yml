@@ -1,8 +1,8 @@
 name: verify
 
-# Checks on a real Mac what cannot be checked anywhere else: that the Swift
+# Checks on real Macs what cannot be checked anywhere else: that the Swift
 # encoder builds, that what it writes decodes back to the source picture, and
-# what Apple's sticker system on that Mac looks like.
+# what Apple's sticker system on each macOS version looks like.
 
 on:
   push:
@@ -18,8 +18,13 @@ concurrency:
 
 jobs:
   macos:
-    runs-on: macos-15
-    timeout-minutes: 12
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-14, macos-26, macos-15-intel]
     steps:
       - uses: actions/checkout@v5
 
@@ -41,7 +46,7 @@ jobs:
           /usr/bin/python3 -c "import imsticker, sys; sys.stdout.write(imsticker.SWIFT_ENCODER)" > "$RUNNER_TEMP/encoder.swift"
           swiftc -typecheck "$RUNNER_TEMP/encoder.swift"
 
-      - name: Real encoder into a stand-in store, decoded and compared
+      - name: Real encoder into stand-in stores, decoded and compared
         if: ${{ !cancelled() }}
         run: bash ci/verify_encoder.sh
 
@@ -50,7 +55,12 @@ jobs:
         continue-on-error: true
         run: bash ci/compare_stickerhack.sh
 
-      - name: Probe the real sticker system
+      - name: Experiments on the real sticker store
         if: ${{ !cancelled() }}
         continue-on-error: true
-        run: bash ci/probe.sh
+        run: bash ci/experiments.sh
+
+      - name: What the sticker frameworks contain
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: bash ci/probe_frameworks.sh

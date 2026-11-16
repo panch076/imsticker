@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
 """Compare what ImageIO decoded from the encoder's output with what went in.
 
-    check_facts.py <facts of exported stickers> <facts of the source images> <expected.json>
+    check_facts.py <facts of exported stickers> <facts of the source images> <expected.json> [IMPORT...]
 
-Both facts files come from ci/inspect_images.swift. The exported stickers are
-the ones ci/verify_encoder.sh imports, in this order (keep the two in step):
+Both facts files come from ci/inspect_images.swift. Each IMPORT says what one
+sticker in the export was made from, as NUMBER=SOURCE:MAXEDGE:up or :noup, for
+example "2=anim.gif:768:noup" for sticker 2 imported with --no-upscale.
 """
 import json
 import math
 import sys
-
-# sticker number -> (source image, --max-edge, upscaling allowed)
-IMPORTED = {
-    1: ("still.png", 256, True),
-    2: ("anim.gif", 256, True),
-    3: ("anim.png", 256, True),
-    4: ("still.png", 768, True),   # default size
-    5: ("anim.gif", 768, False),   # --no-upscale --resample nearest
-    6: ("anim.png", 128, True),    # through the interpreter fallback
-}
 
 # role, longest side (None = --max-edge, "preview" = max(--max-edge, 320)), may enlarge
 STILL_ROLES = [
@@ -103,8 +94,18 @@ def check_frames(report, where, facts, want_frames, size):
             report.check(spot, "delay {}s".format(want["delay"]), ok, delay)
 
 
+def parse_import(text):
+    """'2=anim.gif:768:noup' -> (2, 'anim.gif', 768, False)"""
+    number, rest = text.split("=", 1)
+    name, edge, scaling = rest.rsplit(":", 2)
+    if scaling not in ("up", "noup"):
+        raise ValueError("expected :up or :noup in {!r}".format(text))
+    return int(number), name, int(edge), scaling == "up"
+
+
 def main():
     facts_path, source_path, expected_path = sys.argv[1:4]
+    imported = dict((entry[0], entry[1:]) for entry in map(parse_import, sys.argv[4:]))
     with open(facts_path) as handle:
         exported = dict((item["file"], item) for item in json.load(handle))
     with open(source_path) as handle:
@@ -126,7 +127,7 @@ def main():
 
     # 2. What the tool stored must be the same picture, in the right containers.
     expected_files = set()
-    for number, (name, edge, upscale) in sorted(IMPORTED.items()):
+    for number, (name, edge, upscale) in sorted(imported.items()):
         want_frames = expected["fixtures"][name]["frames"]
         if len(want_frames) == 1:
             for position, (role, role_edge, role_upscale) in enumerate(STILL_ROLES):
