@@ -30,8 +30,12 @@ python3 imsticker.py add cat.png party.gif wave.png
 
 The dry run encodes the images and checks that your library can be opened, but
 changes nothing; do it once first. After a real import, open the sticker drawer
-in Messages. If macOS refuses access to the library, give your terminal app Full
-Disk Access in System Settings > Privacy & Security.
+in Messages.
+
+The library is another program's data, and macOS can keep a terminal out of
+that. If it does, imsticker says so instead of reporting the library missing:
+give your terminal app Full Disk Access in System Settings > Privacy & Security,
+reopen the terminal and run it again.
 
 A file that cannot be encoded is reported as `FAILED` and skipped; the others
 are still imported, and the command exits with status 1. Retry only the failed
@@ -98,6 +102,7 @@ is normal is not known.
 | That they reach your iPhone | The build machines have no iCloud account, so `stickersd` never gets as far as uploading, whichever way the stickers were written. StickerHack's README says its stickers do sync. The default route here also records the save in the history that Core Data's iCloud mirroring works from; whether that makes a difference was not tested. |
 | A library that already holds stickers made by Apple's software, or that has synced | Each build machine's library starts empty. The only stickers in it during an import are ones this tool has just added. |
 | An animation made on Apple silicon, or on macOS 26 | ImageIO on GitHub's Apple-silicon runners could not write one. It needs a physical Mac, and none was tested. |
+| What macOS's privacy protection does on your own Mac | On the build machines nothing stood between a terminal and the library. On your Mac macOS may ask first, or refuse. The message imsticker gives for a refusal was only exercised by simulating one in the unit tests. |
 | macOS 15.1, where the library is in another place | No build machine runs it. Only the unit tests cover it, on stand-in files. |
 | macOS 14 | GitHub no longer offers it. |
 

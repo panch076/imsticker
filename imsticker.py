@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """imsticker - put any PNG / GIF / APNG into the native iMessage sticker library.
 
-The image goes in exactly as it is: no subject lift, no cut-out. Animated GIF
-and APNG files become animated stickers and keep their transparency and their
-frame timing.
+The whole image goes in: no subject lift, no cut-out. It is scaled and
+re-encoded as HEIC. Animated GIF and APNG files become animated stickers and
+keep their transparency and their frame timing.
 
 It works by adding to the Core Data store that `stickersd` keeps on a Mac (see
 README.md for the format). By default the stickers are saved through Core Data
@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -95,6 +96,27 @@ class ToolError(Exception):
 # Locating and opening the store
 # --------------------------------------------------------------------------
 
+# macOS keeps one program out of another's data unless the person allows it,
+# and the sticker library is stickersd's data. A refusal reaches this tool as
+# "Operation not permitted" on the first thing it does with the file.
+ACCESS_HINT = (
+    "If macOS blocked it, allow your terminal app under System Settings > "
+    "Privacy & Security > Full Disk Access, reopen the terminal, and try again."
+)
+
+
+def _is_file(path):
+    """Whether a file is there. Asked with os.stat rather than Path.is_file so
+    that being refused is told apart from the file not existing."""
+    try:
+        return stat.S_ISREG(os.stat(str(path)).st_mode)
+    except PermissionError as exc:
+        raise ToolError("macOS did not allow access to {} ({}).\n{}".format(
+            path, exc.strerror or exc, ACCESS_HINT))
+    except (OSError, ValueError):
+        return False
+
+
 def _last_write(path):
     newest = 0.0
     for suffix in ("", "-wal"):
@@ -110,12 +132,12 @@ def find_db(explicit=None, home=None):
     chosen = explicit or os.environ.get("IMSTICKER_DB")
     if chosen:
         path = Path(chosen).expanduser()
-        if not path.is_file():
+        if not _is_file(path):
             raise ToolError("No sticker database at {}".format(path))
         return path
     home = Path(home) if home else Path.home()
     found = [home.joinpath(*parts) for parts in DB_CANDIDATES]
-    found = [path for path in found if path.is_file()]
+    found = [path for path in found if _is_file(path)]
     if not found:
         looked = "\n".join("  ~/" + "/".join(parts) for parts in DB_CANDIDATES)
         raise ToolError(
@@ -148,11 +170,7 @@ def connect(path, readonly=False):
             continue
         conn.row_factory = sqlite3.Row
         return conn
-    raise ToolError(
-        "Cannot open {}: {}\n"
-        "If macOS blocked it, allow your terminal app under System Settings > "
-        "Privacy & Security > Full Disk Access and try again.".format(path, error)
-    )
+    raise ToolError("Cannot open {}: {}\n{}".format(path, error, ACCESS_HINT))
 
 
 def backup_dir(home=None):
@@ -636,7 +654,7 @@ def sql_insert(db_path, encoded_stickers, name):
 
 def cmd_add(args):
     files = [Path(item).expanduser() for item in args.files]
-    missing = [str(path) for path in files if not path.is_file()]
+    missing = [str(path) for path in files if not _is_file(path)]
     if missing:
         raise ToolError("File not found: {}".format(", ".join(missing)))
     if args.name and len(files) > 1:
@@ -648,7 +666,9 @@ def cmd_add(args):
     try:
         print("Sticker library: {}".format(db_path))
         require_mac()
-        # Find out whether the library can be written before spending time encoding.
+        # Find out whether the library can be read, and then whether it can be
+        # written, before spending time building the helper and encoding.
+        connect(db_path, readonly=True).close()
         model = None
         if args.raw_sql:
             unknown = sql_layout_check(db_path)
@@ -879,7 +899,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="imsticker",
         description="Add PNG / GIF / APNG files to the native iMessage sticker library "
-                    "exactly as they are (no subject cut-out).")
+                    "whole: no subject cut-out, transparency and animation kept.")
     parser.add_argument("--db", help="path to stickers.stickerdb (default: find the live one)")
     commands = parser.add_subparsers(dest="command")
 
@@ -962,8 +982,8 @@ def main(argv=None):
 # The helper, in Swift because both jobs need Apple's frameworks.
 #
 # Encoding: it decodes with ImageIO (which already composites GIF and APNG
-# frames), draws each frame untouched into an RGBA canvas, and writes HEIC for
-# stills or an HEIF image sequence for animations.
+# frames), draws each whole frame, scaled, into an RGBA canvas, and writes HEIC
+# for stills or an HEIF image sequence for animations.
 #
 # Saving ("insert"): it opens the sticker store with Core Data and the model
 # Apple ships, and saves the stickers as managed objects. Core Data then writes

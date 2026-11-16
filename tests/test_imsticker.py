@@ -299,6 +299,16 @@ class CoreDataRoute(StoreCase):
         self.assertEqual(self.counts(), (0, 0))
         self.assertFalse(self.backups.exists())
 
+    def test_a_library_that_cannot_be_read_stops_before_the_helper_is_built(self):
+        self.db.write_bytes(b"not a database at all, " * 60)
+        with mock.patch.object(imsticker, "helper_command") as helper:
+            code, _, err = self.cli("add", self.source("cat.png"))
+        self.assertEqual(code, 1)
+        self.assertIn("Cannot open", err)
+        self.assertIn("Full Disk Access", err)
+        helper.assert_not_called()
+        self.assertFalse(self.backups.exists())
+
     def test_needs_a_mac(self):
         make_store(self.db)
         os.environ.pop("IMSTICKER_ENCODER")
@@ -407,6 +417,17 @@ class Failures(StoreCase):
         code, _, err = self.cli("add", str(self.dir / "nope.png"))
         self.assertEqual(code, 1)
         self.assertIn("File not found", err)
+
+    def test_a_picture_macos_will_not_show_is_not_called_missing(self):
+        make_store(self.db)
+        picture = self.source("cat.png")
+        with mock.patch.object(imsticker.os, "stat", side_effect=_refusing(picture)):
+            code, _, err = self.cli("add", picture)
+        self.assertEqual(code, 1)
+        self.assertIn("did not allow access", err)
+        self.assertIn("Full Disk Access", err)
+        self.assertNotIn("File not found", err)
+        self.assertEqual(self.counts(), (0, 0))
 
     def test_some_other_database_is_refused(self):
         conn = sqlite3.connect(str(self.db))
@@ -693,6 +714,40 @@ class Locating(unittest.TestCase):
         path.write_bytes(b"")
         os.environ["IMSTICKER_DB"] = str(path)
         self.assertEqual(imsticker.find_db(home=self.home), path)
+
+    def test_a_library_macos_will_not_show_is_not_called_missing(self):
+        # What a Mac does when the terminal has not been allowed into another
+        # program's data: the first look at the file is refused.
+        group = self.place(imsticker.DB_CANDIDATES[0], 10)
+        self.place(imsticker.DB_CANDIDATES[1], 5000)  # an old copy must not be used instead
+        with mock.patch.object(imsticker.os, "stat", side_effect=_refusing(group)):
+            with self.assertRaises(imsticker.ToolError) as caught:
+                imsticker.find_db(home=self.home)
+        message = str(caught.exception)
+        self.assertIn("Operation not permitted", message)
+        self.assertIn("Full Disk Access", message)
+        self.assertNotIn("Could not find", message)
+
+    def test_nor_is_one_named_with_db(self):
+        path = self.home / "copy.stickerdb"
+        path.write_bytes(b"")
+        with mock.patch.object(imsticker.os, "stat", side_effect=_refusing(path)):
+            with self.assertRaises(imsticker.ToolError) as caught:
+                imsticker.find_db(str(path), home=self.home)
+        self.assertIn("Full Disk Access", str(caught.exception))
+        self.assertNotIn("No sticker database", str(caught.exception))
+
+
+_real_stat = os.stat
+
+
+def _refusing(refused):
+    """os.stat as macOS answers it for one file the program may not look at."""
+    def stat(path, *args, **kwargs):
+        if str(path) == str(refused):
+            raise PermissionError(1, "Operation not permitted", str(path))
+        return _real_stat(path, *args, **kwargs)
+    return stat
 
 
 class CommandLine(unittest.TestCase):
