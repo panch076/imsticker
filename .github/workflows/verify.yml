@@ -49,7 +49,15 @@ jobs:
 
       - name: Real helper, both routes, decoded and compared
         if: ${{ !cancelled() }}
+        env:
+          # The Intel runner is the one that can write HEIF sequences. If it
+          # ever cannot, fail rather than pass without checking animations.
+          REQUIRE_ANIMATION: ${{ matrix.os == 'macos-15-intel' && 'yes' || 'no' }}
         run: bash ci/verify_encoder.sh
+
+      - name: The real sticker library on this Mac
+        if: ${{ !cancelled() }}
+        run: bash ci/verify_real_library.sh
 
       - name: StickerHack's handling of APNG timing (comparison only)
         if: ${{ !cancelled() }}

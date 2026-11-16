@@ -350,6 +350,14 @@ class AddAnimated(StoreCase):
         self.assertIn("animated 128x128", out)
         self.assertIn("still heavy", out)
 
+    def test_dry_run_also_says_when_it_is_still_heavy(self):
+        make_store(self.db)
+        code, out, _ = self.cli("add", self.source("anim.gif"), "--no-upscale", "--max-bytes", "1000", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("would add  anim.gif: animated 128x128", out)
+        self.assertIn("still heavy", out)
+        self.assertEqual(self.counts(), (0, 0))
+
     def test_shrinks_below_the_source_size_when_not_enlarging(self):
         # The stand-in source is 200 px wide: 200 px is 160 KB, 192 px is 147 KB, 160 px is 102 KB.
         make_store(self.db)
@@ -481,6 +489,36 @@ class BackupRestore(StoreCase):
         self.assertEqual(code, 1)
         self.assertIn("No backups of this library", err)
         self.assertEqual(self.counts(), (0, 0))
+
+    def test_a_save_that_fails_does_not_leave_a_backup_restore_would_offer(self):
+        make_store(self.db)
+        other = sqlite3.connect(str(self.db), isolation_level=None)
+        self.addCleanup(other.close)
+        other.execute("begin immediate")  # someone else is mid-write, so the save cannot start
+        with mock.patch.object(imsticker.sqlite3, "connect", wraps=lambda *a, **k: _quick(*a, **k)):
+            code, _, err = self.cli("add", self.source("cat.png"))
+        other.execute("rollback")
+        self.assertEqual(code, 1)
+        self.assertEqual(list(self.backups.glob("*.backup")), [])
+        self.assertEqual(len(list(self.backups.glob("*.not-imported"))), 1)
+        code, _, err = self.cli("restore", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("No backups of this library", err)
+
+    def test_an_unwritable_folder_is_reported_plainly(self):
+        make_store(self.db)
+        self.assertEqual(self.cli("add", self.source("cat.png"))[0], 0)
+        blocker = self.dir / "a-file-not-a-folder"
+        blocker.write_bytes(b"x")
+        code, _, err = self.cli("export", str(blocker / "inside"))
+        self.assertEqual(code, 1)
+        self.assertTrue(err.startswith("imsticker: "), err)
+        self.assertNotIn("Traceback", err)
+        with mock.patch.dict(os.environ, {"IMSTICKER_BACKUP_DIR": str(blocker / "backups")}):
+            code, _, err = self.cli("add", self.source("cat.png"))
+        self.assertEqual(code, 1)
+        self.assertIn("Could not back up the library, so nothing was changed", err)
+        self.assertEqual(self.counts(), (1, 7))
 
     def test_a_backup_that_fails_leaves_nothing_behind(self):
         broken = self.dir / "broken.stickerdb"

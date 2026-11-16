@@ -1,10 +1,10 @@
 // Can this Mac write an HEIF image sequence at all?
 //
-// GitHub's virtual Apple-silicon Macs cannot (the system has no HEVC video
-// encoder to hand the frames to), and then no sticker tool can make an animated
-// sticker there. This asks ImageIO for the smallest possible sequence, with
-// none of imsticker's code involved, so a missing capability is not mistaken
-// for a bug. Exit status 0 = yes, 3 = no.
+// On GitHub's virtual Apple-silicon Macs ImageIO cannot (why was not
+// established), and then a tool that writes its animations through ImageIO
+// cannot make an animated sticker there. This asks ImageIO for the smallest
+// possible sequence, with none of imsticker's code involved, so a missing
+// capability is not mistaken for a bug. Exit status 0 = yes, 3 = no.
 
 import Foundation
 import ImageIO

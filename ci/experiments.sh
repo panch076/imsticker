@@ -3,16 +3,16 @@
 #
 #   1. Put stickers in both ways imsticker can: rows written with SQL, and the
 #      default, a save through Core Data. Look at the store's change history
-#      (what iCloud sync reads) after each, then restart stickersd and see what
-#      it makes of them.
+#      after each, then restart stickersd and see what it logs.
 #   2. Run Apple's own sticker store code in this process, on a copy of the
-#      store, and ask it for those stickers. If Apple's code reads them back,
-#      the system will.
+#      store, and ask it for those stickers.
 #   3. Hand Apple's own code a plain PNG, a GIF and an APNG, and look at what
 #      it stores, to learn what a sticker made by Apple looks like.
 #   4. Show that stickersd itself does not answer a program Apple did not sign.
 #
-# Best effort; never fails the job. Read the output.
+# This is for looking, not for judging: it is best effort and never fails the
+# job. What must hold is asserted in ci/verify_real_library.sh, which runs
+# first and leaves its own stickers in the library.
 set +e
 cd "$(dirname "$0")/.."
 
@@ -107,31 +107,8 @@ echo "--- iCloud bookkeeping rows (none expected without an iCloud account):"
 sqlite3 -header "$STORE" "select count(*) as RECORD_METADATA from ANSCKRECORDMETADATA" "select Z_PK, ZCLOUDKITEVENTTYPE, ZSUCCEEDED, ZERRORDOMAIN, ZERRORCODE from ANSCKEVENT order by Z_PK desc limit 5"
 
 section "2. build Apple's store code into a test program"
-ARCH=$(uname -m)
-cat > "$WORK/shim/Stickers.swiftinterface" <<EOF
-// swift-interface-format-version: 1.0
-// swift-compiler-version: Apple Swift version 5.9
-// swift-module-flags: -target $ARCH-apple-macos14.0 -enable-library-evolution -swift-version 5 -module-name Stickers
-import Foundation
-import Swift
-public class StickerStore {
-  public enum PersistenceType {
-    case inMemory
-    case sharedFile
-    case customFile(Foundation.URL)
-    case remote
-  }
-  public init(persistence: Stickers.StickerStore.PersistenceType)
-  @objc deinit
-}
-EOF
 ls "$SDK/System/Library/PrivateFrameworks/Stickers.framework" 2>&1 | head -10
-clang -fobjc-arc -DEXP_NO_MAIN -c ci/exp_facade.m -o "$WORK/facade.o" 2>&1 | head -30
-clang -fobjc-arc -framework Foundation -framework CoreGraphics ci/exp_facade.m -o "$WORK/exp_facade" 2>&1 | head -30
-swiftc -I "$WORK/shim" -F "$SDK/System/Library/PrivateFrameworks" -framework Stickers \
-    -framework Foundation -framework CoreGraphics \
-    -import-objc-header ci/exp_bridge.h ci/exp_apple_store.swift "$WORK/facade.o" \
-    -o "$WORK/exp_apple_store" 2>&1 | head -60
+bash ci/build_harness.sh "$WORK" 2>&1 | head -60
 ls -la "$WORK/exp_apple_store" "$WORK/exp_facade" 2>&1
 
 section "2a. Apple's store code reads back what imsticker wrote (on a copy)"

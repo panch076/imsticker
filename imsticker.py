@@ -174,20 +174,23 @@ def backup_db(db_path, directory, kind="backup"):
     The file only gets its final name once it is complete, so a backup that
     failed part-way can never be mistaken for a good one.
     """
-    directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
     target = directory / "stickers.stickerdb.{}.{}.{}".format(library_tag(db_path), stamp, kind)
     partial = Path(str(target) + ".partial")
     failure = None
-    source = sqlite3.connect(str(db_path), timeout=10)
-    destination = sqlite3.connect(str(partial))
+    opened = []
     try:
+        directory.mkdir(parents=True, exist_ok=True)
+        source = sqlite3.connect(str(db_path), timeout=10)
+        opened.append(source)
+        destination = sqlite3.connect(str(partial))
+        opened.append(destination)
         source.backup(destination)
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, OSError) as exc:
         failure = exc
     finally:
-        destination.close()
-        source.close()
+        for connection in reversed(opened):
+            connection.close()
     if failure is not None:
         try:
             partial.unlink()
@@ -546,10 +549,12 @@ def validate_encoded(encoded):
 
 def encode_within_budget(command, source, work_dir, max_edge, resample, no_upscale, max_bytes,
                          animation_only=False):
-    """Encode, stepping the size down until the largest image fits the budget.
+    """Encode, stepping the size down until the sticker's main image fits the budget.
 
-    Stickers that are too heavy show up in the picker but fail to send, so by
-    default nothing over about 1 MB goes in.
+    StickerHack's author found that images over about 1 MB show up as stickers
+    but fail when used, so by default the main image is kept under that. The
+    main image is the one that follows --max-edge; the 320 px variant of a
+    small still does not shrink with it and is not what gets judged.
     """
     edges = [max_edge] + [edge for edge in SHRINK_STEPS if edge < max_edge]
     encoded = None
@@ -562,11 +567,11 @@ def encode_within_budget(command, source, work_dir, max_edge, resample, no_upsca
         encoded = run_encoder(command, source, out_dir, edge, resample, no_upscale, animation_only)
         validate_encoded(encoded)
         encoded["maxEdge"] = edge
-        heaviest = max(encoded["representations"], key=lambda rep: rep["byteCount"])
-        encoded["overBudget"] = bool(max_bytes) and heaviest["byteCount"] > max_bytes
+        main = main_image(encoded)
+        encoded["overBudget"] = bool(max_bytes) and main["byteCount"] > max_bytes
         if not encoded["overBudget"]:
             break
-        produced = max(heaviest["width"], heaviest["height"])
+        produced = max(main["width"], main["height"])
     return encoded
 
 
@@ -574,9 +579,17 @@ def _kb(count):
     return "{:.1f} KB".format(count / 1024.0)
 
 
+def main_image(encoded):
+    """The image a sticker is shown and sent as: the animation, or else the still."""
+    preferred = [rep for rep in encoded["representations"] if rep["preferred"]]
+    return (preferred or encoded["representations"])[0]
+
+
+HEAVY_NOTE = "  (still heavy; may not send, try a smaller --max-edge)"
+
+
 def describe(encoded):
-    main = [rep for rep in encoded["representations"] if rep["preferred"]] or encoded["representations"]
-    rep = main[0]
+    rep = main_image(encoded)
     text = "{} {}x{}, {}".format(
         encoded.get("mode", "sticker"), int(rep["width"]), int(rep["height"]), _kb(rep["byteCount"]))
     if encoded.get("frameCount", 1) > 1:
@@ -664,31 +677,41 @@ def cmd_add(args):
 
         if args.dry_run:
             for source, encoded in ready:
-                print("would add  {}: {}".format(source.name, describe(encoded)))
+                print("would add  {}: {}{}".format(
+                    source.name, describe(encoded), HEAVY_NOTE if encoded["overBudget"] else ""))
             print("Dry run: the library was not changed.")
             return 1 if failures else 0
 
         backup = backup_db(db_path, backup_dir())
-        if model is None:
-            rows = sql_insert(db_path, [encoded for _, encoded in ready], args.name)
-        else:
-            saved = core_data_insert(command, db_path, model, [
-                {
-                    "searchText": args.name,
-                    "representations": [
-                        dict((field, rep[field]) for field in REP_FIELDS)
-                        for rep in encoded["representations"]
-                    ],
-                }
-                for _, encoded in ready
-            ], work_dir)
-            rows = [{"pk": item["primaryKey"], "uri": item["uri"]} for item in saved]
+        try:
+            if model is None:
+                rows = sql_insert(db_path, [encoded for _, encoded in ready], args.name)
+            else:
+                saved = core_data_insert(command, db_path, model, [
+                    {
+                        "searchText": args.name,
+                        "representations": [
+                            dict((field, rep[field]) for field in REP_FIELDS)
+                            for rep in encoded["representations"]
+                        ],
+                    }
+                    for _, encoded in ready
+                ], work_dir)
+                rows = [{"pk": item["primaryKey"], "uri": item["uri"]} for item in saved]
+        except BaseException:
+            # Nothing was imported, so this is not a backup "from before an
+            # import". Take it out of what a plain `restore` would offer.
+            try:
+                os.replace(str(backup), str(backup)[:-len("backup")] + "not-imported")
+            except OSError:
+                pass
+            raise
         added = [(source, encoded, row) for (source, encoded), row in zip(ready, rows)]
     finally:
         shutil.rmtree(str(work_dir), ignore_errors=True)
 
     for source, encoded, row in added:
-        note = "  (still heavy; may not send, try a smaller --max-edge)" if encoded["overBudget"] else ""
+        note = HEAVY_NOTE if encoded["overBudget"] else ""
         print("added  {}: {} -> sticker #{}{}".format(source.name, describe(encoded), row["pk"], note))
     if failures:
         print("{} of {} files were not imported (see FAILED above).".format(len(failures), len(files)))
@@ -865,7 +888,8 @@ def build_parser():
     add.add_argument("--name", help="search text for the sticker (single file only)")
     add.add_argument("--max-edge", type=int, default=768, help="longest side in pixels (default 768)")
     add.add_argument("--max-bytes", type=int, default=1000000,
-                     help="shrink until the sticker is under this size; 0 turns it off (default 1000000)")
+                     help="re-encode at smaller sizes, down to 128 px, until the sticker's main image "
+                          "is at most this many bytes; 0 turns it off (default 1000000)")
     add.add_argument("--no-upscale", action="store_true", help="never enlarge small images")
     add.add_argument("--resample", choices=("auto", "nearest", "smooth"), default="auto",
                      help="nearest keeps pixel art crisp (default: auto)")
@@ -929,6 +953,9 @@ def main(argv=None):
         return 1
     except sqlite3.Error as exc:
         print("imsticker: database error: {}".format(exc), file=sys.stderr)
+        return 1
+    except OSError as exc:  # a folder that cannot be written, a file that vanished
+        print("imsticker: {}".format(exc), file=sys.stderr)
         return 1
 
 
@@ -1162,9 +1189,11 @@ func encodeAnimated(source: CGImageSource, frameCount: Int, isGIF: Bool, options
     guard let first = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
         die("cannot decode the first frame")
     }
-    let (drawWidth, drawHeight) = fitSize(width: first.width, height: first.height, maxEdge: options.maxEdge, upscale: options.upscale)
-    // The sequence is HEVC video underneath and needs even sides. Pad an odd
-    // side with one transparent pixel rather than squeezing the picture.
+    // The sequence is HEVC video underneath, so its sides are kept even to be
+    // safe. An odd side is padded with one transparent pixel rather than the
+    // picture being squeezed, and the limit is taken as even so the padding
+    // never goes over it.
+    let (drawWidth, drawHeight) = fitSize(width: first.width, height: first.height, maxEdge: options.maxEdge - options.maxEdge % 2, upscale: options.upscale)
     let width = drawWidth + drawWidth % 2
     let height = drawHeight + drawHeight % 2
     var smooth = options.resample != "nearest"

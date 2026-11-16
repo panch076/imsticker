@@ -48,12 +48,23 @@ swiftc -o "$WORK/inspect" ci/inspect_images.swift
 
 echo "::group::can this Mac write an animation at all?"
 swiftc -o "$WORK/can_write_heics" ci/can_write_heics.swift
-if "$WORK/can_write_heics"; then
-    CAN_ANIMATE=yes
-else
-    CAN_ANIMATE=no
-fi
+status=0
+"$WORK/can_write_heics" || status=$?
+case "$status" in
+    0) CAN_ANIMATE=yes ;;
+    3) CAN_ANIMATE=no ;;
+    *)
+        echo "::error title=The animation probe broke::can_write_heics exited $status; it should exit 0 (can) or 3 (cannot)."
+        exit 1
+        ;;
+esac
 echo "::endgroup::"
+# One runner is relied on to exercise animations. If it cannot, say so loudly
+# rather than let every job pass without the animated path having run anywhere.
+if [ "$CAN_ANIMATE" = no ] && [ "${REQUIRE_ANIMATION:-no}" = yes ]; then
+    echo "::error title=Animated stickers not checked::The runner relied on for HEIF sequences could not write one, so no job checked the animated path."
+    exit 1
+fi
 
 echo "::group::stills, rows written with SQL"
 STILLS="$WORK/stills.stickerdb"
@@ -105,6 +116,11 @@ if [ "$CAN_ANIMATE" = yes ]; then
     EXPECT_OBJECTS=16
     EXPECT_SAVES=3
 fi
+# And once with the helper interpreted rather than built, saving included.
+time env PATH="$WORK/nobuild:$PATH" "$PY" imsticker.py --db "$APPLE" add --no-restart --max-edge 128 "$F/still.png"
+IMPORTS="$IMPORTS $((EXPECT_SAVES + 1))=still.png:128:up"
+EXPECT_OBJECTS=$((EXPECT_OBJECTS + 8))
+EXPECT_SAVES=$((EXPECT_SAVES + 1))
 imsticker "$APPLE" list -v
 sqlite3 -header "$APPLE" \
     "select Z_PK, Z_ENT, Z_OPT, ZTYPE, ZVERSION, ZLIBRARYINDEX, ZSEARCHTEXT, ZEXTERNALURI from ZMANAGEDSTICKER" \
@@ -115,10 +131,12 @@ sqlite3 -header "$APPLE" \
 imsticker "$APPLE" export "$WORK/apple"
 # shellcheck disable=SC2086
 check apple $IMPORTS
-# Every object saved must be in the store's history, which is what iCloud reads.
+# Every object saved must be in the store's history, which is what iCloud reads,
+# and every sticker must carry the values Apple's own code gives one of its own.
 "$PY" - "$APPLE" "$EXPECT_OBJECTS" "$EXPECT_SAVES" <<'PYTHON'
-import sqlite3, sys
+import sqlite3, sys, uuid
 conn = sqlite3.connect(sys.argv[1])
+conn.row_factory = sqlite3.Row
 inserts = conn.execute("select count(*) from ACHANGE where ZCHANGETYPE = 0").fetchone()[0]
 saves = conn.execute("select count(*) from ATRANSACTION").fetchone()[0]
 authors = [row[0] for row in conn.execute("select ZNAME from ATRANSACTIONSTRING")]
@@ -126,6 +144,28 @@ print("history: {} objects inserted in {} saves, strings {}".format(inserts, sav
 assert inserts == int(sys.argv[2]), "expected {} inserted objects in the history".format(sys.argv[2])
 assert saves == int(sys.argv[3]), "expected {} saves in the history".format(sys.argv[3])
 assert "imsticker" in authors, "the saves should be attributed to imsticker"
+
+stickers = conn.execute("select * from ZMANAGEDSTICKER order by Z_PK").fetchall()
+assert len(stickers) == saves, "one sticker per save in this script"
+assert stickers[0]["ZSEARCHTEXT"] == "a still", "sticker 1: search text is {!r}".format(stickers[0]["ZSEARCHTEXT"])
+for number, row in enumerate(stickers, 1):
+    where = "sticker {}".format(number)
+    identifier = str(uuid.UUID(bytes=bytes(row["ZIDENTIFIER"]))).upper()
+    assert (row["ZTYPE"], row["ZEFFECT"], row["ZVERSION"]) == (1, 0, 1), where + ": type, effect, version"
+    assert row["ZEXTERNALURI"] == "sticker:///user/identifier/" + identifier, where + ": " + row["ZEXTERNALURI"]
+    assert row["ZLIBRARYINDEX"] == 1024.0 * number, where + ": library index {}".format(row["ZLIBRARYINDEX"])
+    assert row["ZNAME"] == "", where + ": name"
+    assert row["ZCREATIONDATE"] == row["ZLASTUSEDDATE"] and row["ZCREATIONDATE"] > 800000000, where + ": dates"
+    images = conn.execute(
+        "select ZROLE, ZUTI, ZISPREFERRED, ZVERSION, ZBYTECOUNT, length(ZDATA) as BYTES, length(ZIDENTIFIER) as IDENT "
+        "from ZMANAGEDREPRESENTATION where ZSTICKER = ? order by ZINDEX", (row["Z_PK"],)).fetchall()
+    preferred = [image["ZROLE"].rsplit(".", 1)[-1] for image in images if image["ZISPREFERRED"]]
+    animated = any(image["ZUTI"] == "public.heics" for image in images)
+    assert preferred == (["animated"] if animated else ["still"]), where + ": preferred image is {}".format(preferred)
+    assert all(image["ZVERSION"] == 1 and image["IDENT"] == 16 for image in images), where + ": image version, identifier"
+    assert all(image["ZBYTECOUNT"] == image["BYTES"] > 0 for image in images), where + ": image byte counts"
+    assert row["ZBYTECOUNT"] == sum(image["BYTES"] for image in images), where + ": total byte count"
+print("stored values: as Apple's own code writes them, for {} stickers".format(len(stickers)))
 PYTHON
 echo "::endgroup::"
 
