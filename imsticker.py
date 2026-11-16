@@ -459,13 +459,15 @@ def _encoder_failure(proc, what="encoder failed"):
     return "{}: {}{}".format(what, detail, hint)
 
 
-def run_encoder(command, source, out_dir, max_edge, resample, no_upscale):
+def run_encoder(command, source, out_dir, max_edge, resample, no_upscale, animation_only=False):
     args = list(command) + [
         "--input", str(source), "--output-dir", str(out_dir),
         "--max-edge", str(max_edge), "--resample", resample,
     ]
     if no_upscale:
         args.append("--no-upscale")
+    if animation_only:
+        args.append("--animation-only")
     try:
         proc = subprocess.run(args, capture_output=True, text=True)
     except OSError as exc:
@@ -502,7 +504,8 @@ def validate_encoded(encoded):
         rep["byteCount"] = path.stat().st_size
 
 
-def encode_within_budget(command, source, work_dir, max_edge, resample, no_upscale, max_bytes):
+def encode_within_budget(command, source, work_dir, max_edge, resample, no_upscale, max_bytes,
+                         animation_only=False):
     """Encode, stepping the size down until the largest image fits the budget.
 
     Stickers that are too heavy show up in the picker but fail to send, so by
@@ -514,7 +517,7 @@ def encode_within_budget(command, source, work_dir, max_edge, resample, no_upsca
     for edge in edges:
         out_dir = Path(work_dir) / "edge-{}".format(edge)
         out_dir.mkdir(parents=True, exist_ok=True)
-        encoded = run_encoder(command, source, out_dir, edge, resample, no_upscale)
+        encoded = run_encoder(command, source, out_dir, edge, resample, no_upscale, animation_only)
         validate_encoded(encoded)
         encoded["maxEdge"] = edge
         heaviest = max(encoded["representations"], key=lambda rep: rep["byteCount"])
@@ -611,7 +614,7 @@ def cmd_add(args):
             try:
                 encoded = encode_within_budget(
                     command, source, work_dir / str(position), args.max_edge,
-                    args.resample, args.no_upscale, args.max_bytes)
+                    args.resample, args.no_upscale, args.max_bytes, args.animation_only)
             except ToolError as exc:
                 failures.append(source)
                 print("FAILED  {}: {}".format(source.name, exc), file=sys.stderr)
@@ -679,9 +682,11 @@ def cmd_list(args):
         stickers = conn.execute(
             "select * from {} order by Z_PK".format(STICKER_TABLE)).fetchall()
         rep_fields = ", ".join(name for name in rep_cols if name != "ZDATA")
+        # Core Data hands out keys in no particular order; ZINDEX is the intended one.
+        order = "ZSTICKER, ZINDEX, Z_PK" if "ZINDEX" in rep_cols else "ZSTICKER, Z_PK"
         reps = conn.execute(
             "select {}, length(ZDATA) as DATA_LEN, substr(ZDATA, 1, 16) as DATA_HEAD "
-            "from {} order by ZSTICKER, Z_PK".format(rep_fields, REP_TABLE)).fetchall()
+            "from {} order by {}".format(rep_fields, REP_TABLE, order)).fetchall()
     finally:
         conn.close()
 
@@ -821,6 +826,9 @@ def build_parser():
     add.add_argument("--no-upscale", action="store_true", help="never enlarge small images")
     add.add_argument("--resample", choices=("auto", "nearest", "smooth"), default="auto",
                      help="nearest keeps pixel art crisp (default: auto)")
+    add.add_argument("--animation-only", action="store_true",
+                     help="for an animated image, store only the animation, without the still "
+                          "and keyboard preview that normally go with it")
     add.add_argument("--raw-sql", action="store_true",
                      help="write the database rows directly instead of saving through Core Data "
                           "(works without Apple's model, but the change is not recorded in the "
@@ -922,6 +930,7 @@ struct Options {
     var maxEdge = 768
     var upscale = true
     var resample = "auto"
+    var animationOnly = false
 }
 
 struct StillSpec {
@@ -943,6 +952,11 @@ func parseOptions(_ arguments: [String]) -> Options {
         let argument = arguments[index]
         if argument == "--no-upscale" {
             options.upscale = false
+            index += 1
+            continue
+        }
+        if argument == "--animation-only" {
+            options.animationOnly = true
             index += 1
             continue
         }
@@ -1036,6 +1050,17 @@ func frameDelay(_ source: CGImageSource, _ index: Int) -> Double {
     return 0.1
 }
 
+func writeHEIC(_ image: CGImage, to url: URL) {
+    guard let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.heic" as CFString, 1, nil) else {
+        die("cannot create an HEIC writer")
+    }
+    let properties: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.9]
+    CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+    if !CGImageDestinationFinalize(destination) {
+        die("failed to write \(url.path)")
+    }
+}
+
 func encodeStill(source: CGImageSource, options: Options, outputDir: URL) -> Output {
     guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
         die("cannot decode the image")
@@ -1060,14 +1085,7 @@ func encodeStill(source: CGImageSource, options: Options, outputDir: URL) -> Out
         )
         let rendered = render(image, width: width, height: height, smooth: smooth)
         let url = outputDir.appendingPathComponent("rep-\(index).heic")
-        guard let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.heic" as CFString, 1, nil) else {
-            die("cannot create an HEIC writer")
-        }
-        let properties: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.9]
-        CGImageDestinationAddImage(destination, rendered, properties as CFDictionary)
-        if !CGImageDestinationFinalize(destination) {
-            die("failed to write \(url.path)")
-        }
+        writeHEIC(rendered, to: url)
         representations.append(Representation(
             role: spec.role,
             uti: "public.heic",
@@ -1142,24 +1160,54 @@ func encodeAnimated(source: CGImageSource, frameCount: Int, isGIF: Bool, options
     if !CGImageDestinationFinalize(destination) {
         die("failed to write \(url.path)")
     }
+
+    var representations: [Representation] = []
+    if !options.animationOnly {
+        // A still of the first frame and a small keyboard preview, the two
+        // roles the system uses wherever a sticker is shown without moving.
+        let stillURL = outputDir.appendingPathComponent("rep-0.heic")
+        writeHEIC(render(first, width: width, height: height, smooth: smooth), to: stillURL)
+        representations.append(Representation(
+            role: "com.apple.stickers.role.still",
+            uti: "public.heic",
+            width: width,
+            height: height,
+            byteCount: byteCount(stillURL),
+            preferred: false,
+            index: 0,
+            path: stillURL.path
+        ))
+        let (previewWidth, previewHeight) = fitSize(width: first.width, height: first.height, maxEdge: 100, upscale: false)
+        let previewURL = outputDir.appendingPathComponent("rep-1.heic")
+        writeHEIC(render(first, width: previewWidth, height: previewHeight, smooth: smooth), to: previewURL)
+        representations.append(Representation(
+            role: "com.apple.stickers.role.keyboard",
+            uti: "public.heic",
+            width: previewWidth,
+            height: previewHeight,
+            byteCount: byteCount(previewURL),
+            preferred: false,
+            index: 1,
+            path: previewURL.path
+        ))
+    }
+    representations.append(Representation(
+        role: "com.apple.stickers.role.animated",
+        uti: "public.heics",
+        width: width,
+        height: height,
+        byteCount: byteCount(url),
+        preferred: true,
+        index: 2,
+        path: url.path
+    ))
     return Output(
         mode: "animated",
         sourceWidth: first.width,
         sourceHeight: first.height,
         frameCount: frameCount,
         resample: smooth ? "smooth" : "nearest",
-        representations: [
-            Representation(
-                role: "com.apple.stickers.role.animated",
-                uti: "public.heics",
-                width: width,
-                height: height,
-                byteCount: byteCount(url),
-                preferred: true,
-                index: 2,
-                path: url.path
-            )
-        ]
+        representations: representations
     )
 }
 

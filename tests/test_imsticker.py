@@ -261,7 +261,7 @@ class CoreDataRoute(StoreCase):
         self.assertIn("-> sticker #1", out)
         self.assertIn("added  anim.gif: animated 448x448", out)
         self.assertIn("-> sticker #2", out)
-        self.assertEqual(self.counts(), (2, 8))
+        self.assertEqual(self.counts(), (2, 10))
         roles = [row[0] for row in rows(self.db, "select ZROLE from ZMANAGEDREPRESENTATION where ZSTICKER = 1 order by ZINDEX")]
         self.assertEqual(roles, ROLES)
         self.assertEqual(len(list(self.backups.glob("*.backup"))), 1)
@@ -318,16 +318,23 @@ class AddAnimated(StoreCase):
         self.assertIn("animated 448x448", out)
         self.assertIn("12 frames", out)
         self.assertNotIn("still heavy", out)
-        rep = rows(self.db, "select * from ZMANAGEDREPRESENTATION")
-        self.assertEqual(len(rep), 1)
-        rep = rep[0]
+        # The animation comes with a still of the first frame and a keyboard preview.
+        reps = rows(self.db, "select * from ZMANAGEDREPRESENTATION order by ZINDEX")
         self.assertEqual(
-            (rep["ZROLE"], rep["ZUTI"], rep["ZINDEX"], rep["ZISPREFERRED"], rep["ZSIZE_W"]),
-            ("com.apple.stickers.role.animated", "public.heics", 2, 1, 448.0))
-        data = bytes(rep["ZDATA"])
+            [(rep["ZROLE"].rsplit(".", 1)[-1], rep["ZUTI"], rep["ZINDEX"], rep["ZISPREFERRED"], rep["ZSIZE_W"]) for rep in reps],
+            [("still", "public.heic", 0, 0, 448.0), ("keyboard", "public.heic", 1, 0, 100.0),
+             ("animated", "public.heics", 2, 1, 448.0)])
+        data = bytes(reps[2]["ZDATA"])
         self.assertEqual(data[4:12], b"ftypmsf1")
         self.assertEqual(len(data), 12 + 448 * 448 * 4)
         self.assertLessEqual(len(data), 1000000)
+
+    def test_animation_alone_on_request(self):
+        make_store(self.db)
+        code, out, _ = self.cli("add", self.source("anim.gif"), "--animation-only")
+        self.assertEqual(code, 0)
+        reps = rows(self.db, "select ZROLE, ZINDEX, ZISPREFERRED from ZMANAGEDREPRESENTATION")
+        self.assertEqual([tuple(rep) for rep in reps], [("com.apple.stickers.role.animated", 2, 1)])
 
     def test_budget_can_be_turned_off(self):
         make_store(self.db)
@@ -484,7 +491,7 @@ class ReadBack(StoreCase):
         self.assertIn("(2 stickers)", out)
         self.assertIn('#1  user', out)
         self.assertIn('"Troll"', out)
-        self.assertIn("[animated]", out)
+        self.assertIn("[still, keyboard, animated]", out)
 
         code, out, _ = self.cli("list", "-v")
         self.assertEqual(code, 0)
@@ -496,7 +503,9 @@ class ReadBack(StoreCase):
         out_dir = self.dir / "one"
         code, out, _ = self.cli("export", str(out_dir), "--sticker", "2")
         self.assertEqual(code, 0)
-        self.assertEqual([path.name for path in out_dir.iterdir()], ["sticker2_2_animated.heics"])
+        self.assertEqual(
+            sorted(path.name for path in out_dir.iterdir()),
+            ["sticker2_0_still.heic", "sticker2_1_keyboard.heic", "sticker2_2_animated.heics"])
 
 
 class LiveStore(StoreCase):

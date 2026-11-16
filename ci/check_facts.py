@@ -110,12 +110,18 @@ def as_written(frames):
 
 
 def parse_import(text):
-    """'2=anim.gif:768:noup' -> (2, 'anim.gif', 768, False)"""
+    """'2=anim.gif:768:noup' -> (2, 'anim.gif', 768, False, False)
+
+    A trailing ':only' means the sticker was imported with --animation-only.
+    """
     number, rest = text.split("=", 1)
+    only = rest.endswith(":only")
+    if only:
+        rest = rest[:-len(":only")]
     name, edge, scaling = rest.rsplit(":", 2)
     if scaling not in ("up", "noup"):
         raise ValueError("expected :up or :noup in {!r}".format(text))
-    return int(number), name, int(edge), scaling == "up"
+    return int(number), name, int(edge), scaling == "up", only
 
 
 def main():
@@ -142,7 +148,7 @@ def main():
 
     # 2. What the tool stored must be the same picture, in the right containers.
     expected_files = set()
-    for number, (name, edge, upscale) in sorted(imported.items()):
+    for number, (name, edge, upscale, animation_only) in sorted(imported.items()):
         want_frames = expected["fixtures"][name]["frames"]
         if len(want_frames) == 1:
             for position, (role, role_edge, role_upscale) in enumerate(STILL_ROLES):
@@ -160,6 +166,19 @@ def main():
                     check_frames(report, filename, facts, want_frames, size)
         else:
             size = even(fit(canvas[0], canvas[1], edge, upscale))
+            if not animation_only:
+                # The animation comes with a still of its first frame, at the
+                # animation's size, and a small keyboard preview.
+                first_frame = [dict(want_frames[0], delay=None)]
+                for position, role, role_size in (
+                        (0, "still", size), (1, "keyboard", fit(canvas[0], canvas[1], 100, False))):
+                    filename = "sticker{}_{}_{}.heic".format(number, position, role)
+                    expected_files.add(filename)
+                    facts = exported.get(filename)
+                    report.check(filename, "was exported", facts is not None, "missing")
+                    if facts:
+                        report.check(filename, "is HEIC", facts["type"] == "public.heic", facts["type"])
+                        check_frames(report, filename, facts, first_frame, role_size)
             filename = "sticker{}_2_animated.heics".format(number)
             expected_files.add(filename)
             facts = exported.get(filename)

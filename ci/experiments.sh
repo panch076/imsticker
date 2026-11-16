@@ -129,6 +129,7 @@ ls "$SDK/System/Library/PrivateFrameworks/Stickers.framework" 2>&1 | head -10
 clang -fobjc-arc -DEXP_NO_MAIN -c ci/exp_facade.m -o "$WORK/facade.o" 2>&1 | head -30
 clang -fobjc-arc -framework Foundation -framework CoreGraphics ci/exp_facade.m -o "$WORK/exp_facade" 2>&1 | head -30
 swiftc -I "$WORK/shim" -F "$SDK/System/Library/PrivateFrameworks" -framework Stickers \
+    -framework Foundation -framework CoreGraphics \
     -import-objc-header ci/exp_bridge.h ci/exp_apple_store.swift "$WORK/facade.o" \
     -o "$WORK/exp_apple_store" 2>&1 | head -60
 ls -la "$WORK/exp_apple_store" "$WORK/exp_facade" 2>&1
@@ -151,6 +152,10 @@ if [ -x "$WORK/exp_apple_store" ]; then
     "$WORK/exp_apple_store" "$COPY" donate "$(uuidgen)" "donated apng" - public.png 96 64 com.apple.stickers.role.animated "$F/anim.png"
     "$PY" imsticker.py --db "$COPY" export "$WORK/exported" --sticker 1 > /dev/null
     "$WORK/exp_apple_store" "$COPY" donate "$(uuidgen)" "donated heic" - public.heic 256 171 com.apple.stickers.role.still "$WORK/exported/sticker1_0_still.heic"
+    echo "--- and the entry point StickerKit has for adding to the library itself:"
+    "$WORK/exp_apple_store" "$COPY" stickerkit "$F/still.png" 96 64 add
+    "$WORK/exp_apple_store" "$COPY" stickerkit "$F/anim.gif" 96 64 add
+    "$WORK/exp_apple_store" "$COPY" stickerkit "$F/anim.png" 96 64 add
     echo "--- the copy afterwards:"
     dump_rows "$COPY"
     dump_history "$COPY"

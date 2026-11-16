@@ -55,11 +55,11 @@ def main():
     args = sys.argv[1:]
     if args and args[0] == "insert":
         return insert(args[1:])
-    options = {"--no-upscale": False}
+    options = {"--no-upscale": False, "--animation-only": False}
     index = 0
     while index < len(args):
-        if args[index] == "--no-upscale":
-            options["--no-upscale"] = True
+        if args[index] in ("--no-upscale", "--animation-only"):
+            options[args[index]] = True
             index += 1
         else:
             options[args[index]] = args[index + 1]
@@ -82,6 +82,17 @@ def main():
         edge = min(edge, 200)  # pretend the source is 200 px wide
     reps = []
     if "anim" in source.name:
+        if not options["--animation-only"]:
+            # The still of the first frame and the keyboard preview.
+            for position, (role, size) in enumerate((
+                    ("com.apple.stickers.role.still", edge), ("com.apple.stickers.role.keyboard", min(edge, 100)))):
+                path = out_dir / "rep-{}.heic".format(position)
+                path.write_bytes(b"\x00\x00\x00\x18ftypheic" + bytes([position]) * (size * 3))
+                reps.append({
+                    "role": role, "uti": "public.heic", "width": size, "height": size,
+                    "byteCount": path.stat().st_size, "preferred": False,
+                    "index": position, "path": str(path),
+                })
         brand = b"ftypheic" if os.environ.get("FAKE_BAD_BRAND") else b"ftypmsf1"
         path = out_dir / "animated.heics"
         # Size grows with the square of the edge: 768 px is about 2.36 MB.

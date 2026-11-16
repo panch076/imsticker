@@ -111,8 +111,45 @@ static void printSticker(id sticker) {
     }
 }
 
-// Build one of Apple's facade objects. When a store opened in this process was
-// handed in, put it where the facade keeps the one it would reach over XPC.
+// Apple's entry-point objects keep the store they talk to in an instance
+// variable; by default that store reaches stickersd over XPC. When a store
+// opened in this process was handed in, put it there instead. Returns whether
+// the object now uses the in-process store.
+static BOOL adoptStore(id object, const char *variable, id store) {
+    if (object == nil || store == nil) {
+        return NO;
+    }
+    Class cls = object_getClass(object);
+    Ivar ivar = class_getInstanceVariable(cls, variable);
+    if (ivar == NULL) {
+        say(@"%s keeps no '%s'; using it as it is", class_getName(cls), variable);
+        return NO;
+    }
+    ptrdiff_t offset = ivar_getOffset(ivar);
+    size_t words = (class_getInstanceSize(cls) - (size_t)offset) / sizeof(void *);
+    void **slot = (void **)((char *)(__bridge void *)object + offset);
+    NSMutableString *layout = [NSMutableString string];
+    for (size_t i = 0; i < words && i < 6; i++) {
+        [layout appendFormat:@" %p", slot[i]];
+    }
+    say(@"%s: '%s' is at +%td, with %zu words to the end of the object:%@", class_getName(cls), variable, offset, words, layout);
+    void *existing = slot[0];
+    if (existing == NULL) {
+        say(@"  nothing there to replace; using it as it is");
+        return NO;
+    }
+    const char *theirs = object_getClassName((__bridge id)existing);
+    const char *ours = object_getClassName(store);
+    say(@"  it holds a %s; the store opened here is a %s", theirs, ours);
+    if (strcmp(theirs, ours) != 0) {
+        say(@"  different classes, so not replacing it");
+        return NO;
+    }
+    slot[0] = (__bridge_retained void *)store;  // the one it had is leaked, on purpose
+    say(@"  replaced with the store opened in this process");
+    return YES;
+}
+
 static id makeFacade(NSString *className, id store) {
     Class cls = NSClassFromString(className);
     if (cls == Nil) {
@@ -120,36 +157,7 @@ static id makeFacade(NSString *className, id store) {
         return nil;
     }
     id facade = [[cls alloc] init];
-    if (facade == nil || store == nil) {
-        return facade;
-    }
-    Ivar ivar = class_getInstanceVariable(cls, "store");
-    if (ivar == NULL) {
-        say(@"%@ keeps no 'store'; using it as it is", className);
-        return facade;
-    }
-    ptrdiff_t offset = ivar_getOffset(ivar);
-    size_t words = (class_getInstanceSize(cls) - (size_t)offset) / sizeof(void *);
-    void **slot = (void **)((char *)(__bridge void *)facade + offset);
-    NSMutableString *layout = [NSMutableString string];
-    for (size_t i = 0; i < words && i < 6; i++) {
-        [layout appendFormat:@" %p", slot[i]];
-    }
-    say(@"%@: 'store' is at +%td, with %zu words to the end of the object:%@", className, offset, words, layout);
-    void *existing = slot[0];
-    if (existing == NULL) {
-        say(@"  nothing there to replace; using the facade as it is");
-        return facade;
-    }
-    const char *theirs = object_getClassName((__bridge id)existing);
-    const char *ours = object_getClassName(store);
-    say(@"  it holds a %s; the store opened here is a %s", theirs, ours);
-    if (strcmp(theirs, ours) != 0) {
-        say(@"  different classes, so not replacing it");
-        return facade;
-    }
-    slot[0] = (__bridge_retained void *)store;  // the one it had is leaked, on purpose
-    say(@"  replaced with the store opened in this process");
+    adoptStore(facade, "store", store);
     return facade;
 }
 
@@ -233,7 +241,7 @@ static int commandDonate(id store, NSArray<NSString *> *arguments) {
     return 0;
 }
 
-static int commandStickerKit(NSArray<NSString *> *arguments) {
+static int commandStickerKit(id store, NSArray<NSString *> *arguments) {
     if (dlopen("/System/Library/Frameworks/StickerKit.framework/StickerKit", RTLD_NOW) == NULL) {
         say(@"stickerkit: cannot load StickerKit: %s", dlerror());
         return 1;
@@ -272,10 +280,12 @@ static int commandStickerKit(NSArray<NSString *> *arguments) {
         }
         if (recent == 0 && sticker != nil && [arguments containsObject:@"add"]) {
             id kitStore = [[storeClass alloc] init];
+            BOOL here = adoptStore(kitStore, "stickerStore", store);
             SEL add = NSSelectorFromString(@"addSticker:");
             if ([kitStore respondsToSelector:add]) {
                 BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(kitStore, add, sticker);
-                say(@"stickerkit: -[STKStickerStore addSticker:] returned %d", ok);
+                say(@"stickerkit: -[STKStickerStore addSticker:] %s returned %d, sticker %@",
+                    here ? "into the store opened here" : "over XPC", ok, describe(valueOrNote(sticker, @"identifier")));
             }
         }
     }
@@ -311,7 +321,7 @@ int STKExperimentRun(id store, NSArray<NSString *> *arguments) {
             return commandDonate(store, arguments);
         }
         if ([command isEqualToString:@"stickerkit"] && arguments.count >= 4) {
-            return commandStickerKit(arguments);
+            return commandStickerKit(store, arguments);
         }
         say(@"unknown command or missing arguments: %@", [arguments componentsJoinedByString:@" "]);
         return 2;

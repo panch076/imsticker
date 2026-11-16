@@ -76,10 +76,11 @@ if [ "$CAN_ANIMATE" = yes ]; then
     new_store "$ANIMATED"
     time imsticker "$ANIMATED" add --raw-sql --no-restart --max-edge 256 "$F/anim.gif" "$F/anim.png"       # stickers 1 and 2
     time imsticker "$ANIMATED" add --raw-sql --no-restart --no-upscale --resample nearest "$F/anim.gif"   # sticker 3
+    time imsticker "$ANIMATED" add --raw-sql --no-restart --max-edge 128 --animation-only "$F/anim.png"   # sticker 4
     imsticker "$ANIMATED" list -v
     imsticker "$ANIMATED" export "$WORK/animated"
     file "$WORK/animated"/* || true
-    check animated 1=anim.gif:256:up 2=anim.png:256:up 3=anim.gif:768:noup
+    check animated 1=anim.gif:256:up 2=anim.png:256:up 3=anim.gif:768:noup 4=anim.png:128:up:only
     echo "--- what an animated sticker is on disk"
     "$PY" ci/heif_boxes.py "$WORK/animated/sticker2_2_animated.heics" || true
     echo "::endgroup::"
@@ -97,10 +98,12 @@ IMPORTS="1=still.png:256:up"
 EXPECT_OBJECTS=8
 EXPECT_SAVES=1
 if [ "$CAN_ANIMATE" = yes ]; then
-    time imsticker "$APPLE" add --no-restart --max-edge 256 "$F/anim.gif" "$F/anim.png"          # stickers 2 and 3
+    # One at a time: Core Data numbers the stickers of a single save in no particular order.
+    time imsticker "$APPLE" add --no-restart --max-edge 256 "$F/anim.gif"                        # sticker 2
+    time imsticker "$APPLE" add --no-restart --max-edge 256 "$F/anim.png"                        # sticker 3
     IMPORTS="$IMPORTS 2=anim.gif:256:up 3=anim.png:256:up"
-    EXPECT_OBJECTS=12
-    EXPECT_SAVES=2
+    EXPECT_OBJECTS=16
+    EXPECT_SAVES=3
 fi
 imsticker "$APPLE" list -v
 sqlite3 -header "$APPLE" \
