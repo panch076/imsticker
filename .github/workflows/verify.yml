@@ -1,0 +1,56 @@
+name: verify
+
+# Checks on a real Mac what cannot be checked anywhere else: that the Swift
+# encoder builds, that what it writes decodes back to the source picture, and
+# what Apple's sticker system on that Mac looks like.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: System
+        run: |
+          sw_vers
+          uname -m
+          swift --version
+          /usr/bin/python3 --version
+          sqlite3 --version
+
+      - name: Unit tests on Apple's own Python
+        if: ${{ !cancelled() }}
+        run: /usr/bin/python3 -m unittest discover -s tests
+
+      - name: Encoder type-checks
+        if: ${{ !cancelled() }}
+        run: |
+          /usr/bin/python3 -c "import imsticker, sys; sys.stdout.write(imsticker.SWIFT_ENCODER)" > "$RUNNER_TEMP/encoder.swift"
+          swiftc -typecheck "$RUNNER_TEMP/encoder.swift"
+
+      - name: Real encoder into a stand-in store, decoded and compared
+        if: ${{ !cancelled() }}
+        run: bash ci/verify_encoder.sh
+
+      - name: StickerHack's handling of APNG timing (comparison only)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: bash ci/compare_stickerhack.sh
+
+      - name: Probe the real sticker system
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: bash ci/probe.sh
