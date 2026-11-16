@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """imsticker - put any PNG / GIF / APNG into the native iMessage sticker library.
 
 The whole image goes in: no subject lift, no cut-out. It is scaled and
@@ -18,6 +19,11 @@ line tools installed (`python3`, `swift`).
     python3 imsticker.py restore
 
 Written for Python 3.9 (what Apple ships) and the standard library only.
+
+imsticker is free software: you may redistribute and modify it under the terms
+of the GNU General Public License, version 3, as published by the Free Software
+Foundation. It comes with no warranty. The licence is in the file LICENSE and
+at <https://www.gnu.org/licenses/gpl-3.0.html>.
 """
 from __future__ import annotations
 

@@ -291,3 +291,9 @@ python3 -m unittest discover -s tests
 
 These run anywhere and cover the tool's own logic against stand-in databases.
 The checks that need a Mac are in `ci/` and run on every push.
+
+## Licence
+
+imsticker is free software under the [GNU General Public License, version
+3](LICENSE), the licence of StickerHack, whose encoder this one follows. It
+comes with no warranty.
