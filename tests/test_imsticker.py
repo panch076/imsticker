@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import sqlite3
 import sys
 import tempfile
@@ -563,6 +564,260 @@ class BackupRestore(StoreCase):
         code, _, err = self.cli("restore", "--yes")
         self.assertEqual(code, 1)
         self.assertIn("No backups of this library", err)
+
+
+class BackupByHand(StoreCase):
+    """`backup` saves a copy whenever it is asked to, apart from the one that
+    is made before every import."""
+
+    def by_hand(self):
+        return sorted(self.backups.glob("stickers.stickerdb.*.manual"))
+
+    def stickers_in(self, path):
+        return rows(path, "select count(*) from ZMANAGEDSTICKER")[0][0]
+
+    def test_saves_a_copy_and_changes_nothing(self):
+        make_store(self.db)
+        seed_sticker(self.db, 1, 1024)
+        before = self.db.read_bytes()
+        code, out, err = self.cli("backup")
+        self.assertEqual((code, err), (0, ""))
+        saved = self.by_hand()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(self.stickers_in(saved[0]), 1)
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertIn("Backed up 1 sticker (1 image, ", out)
+        self.assertIn(str(saved[0]), out)
+        # Nothing else is left in the folder: no half-written file, and no
+        # backup of a kind that a plain restore would pick up.
+        self.assertEqual(list(self.backups.iterdir()), saved)
+
+    def test_it_says_how_to_put_it_back_and_that_works(self):
+        make_store(self.db)
+        seed_sticker(self.db, 1, 1024)
+        code, out, _ = self.cli("backup")
+        self.assertEqual(code, 0)
+        saved = self.by_hand()[0]
+        command = [line.strip() for line in out.splitlines() if " restore " in line]
+        self.assertEqual(len(command), 1)
+        words = shlex.split(command[0])
+        self.assertEqual(words[:2], ["python3", "imsticker.py"])
+        self.assertEqual(words[2:], ["--db", os.path.abspath(str(self.db)), "restore", os.path.abspath(str(saved))])
+
+        self.assertEqual(self.cli("add", self.source("cat.png"))[0], 0)
+        self.assertEqual(self.cli("add", self.source("dog.png"))[0], 0)
+        self.assertEqual(self.counts(), (3, 15))
+        self.assertEqual(self.cli(*(words[4:] + ["--yes"]))[0], 0)
+        self.assertEqual(self.counts(), (1, 1))
+
+    def test_a_plain_restore_still_undoes_the_last_import(self):
+        make_store(self.db)
+        self.assertEqual(self.cli("add", self.source("cat.png"))[0], 0)
+        time.sleep(0.01)  # the names carry the time, to the millisecond
+        self.assertEqual(self.cli("backup")[0], 0)  # newer than the import's own backup
+        code, out, _ = self.cli("restore", "--yes")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.counts(), (0, 0))
+        # It says that a newer one exists, and how to put that one back.
+        self.assertIn("made with `backup`", out)
+        self.assertIn(os.path.abspath(str(self.by_hand()[0])), out)
+
+    def test_an_older_one_is_not_mentioned(self):
+        make_store(self.db)
+        self.assertEqual(self.cli("backup")[0], 0)
+        time.sleep(0.01)
+        self.assertEqual(self.cli("add", self.source("cat.png"))[0], 0)
+        code, out, _ = self.cli("restore", "--yes")
+        self.assertEqual(code, 0)
+        self.assertNotIn("made with `backup`", out)
+
+    def test_restore_with_only_backups_made_by_hand_names_the_newest(self):
+        make_store(self.db)
+        seed_sticker(self.db, 1, 1024)
+        self.assertEqual(self.cli("backup")[0], 0)
+        time.sleep(0.01)
+        self.assertEqual(self.cli("backup")[0], 0)
+        code, out, err = self.cli("restore", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("No backup from before an import", err)
+        self.assertIn(os.path.abspath(str(self.by_hand()[-1])), err)
+        self.assertNotIn(self.by_hand()[0].name, err)
+        self.assertEqual(self.counts(), (1, 1))
+        self.assertEqual(list(self.backups.glob("*.before-restore")), [])
+
+    def test_another_library_its_backups_are_not_offered(self):
+        make_store(self.db)
+        other = self.dir / "other.stickerdb"
+        make_store(other)
+        imsticker.backup_db(other, self.backups, kind=imsticker.BY_HAND)
+        code, _, err = self.cli("restore", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("No backups of this library", err)
+
+    def test_into_a_folder(self):
+        make_store(self.db)
+        folder = self.dir / "kept"
+        folder.mkdir()
+        code, out, _ = self.cli("backup", str(folder))
+        self.assertEqual(code, 0)
+        inside = list(folder.iterdir())
+        self.assertEqual(len(inside), 1)
+        self.assertTrue(inside[0].name.endswith(".manual"), inside[0].name)
+        self.assertFalse(self.backups.exists())
+        # A name that ends in a slash is a folder too, and is made if need be.
+        code, _, _ = self.cli("backup", str(self.dir / "new" / "deeper") + "/")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(list((self.dir / "new" / "deeper").iterdir())), 1)
+
+    def test_to_a_named_file_and_never_over_one(self):
+        make_store(self.db)
+        seed_sticker(self.db, 1, 1024)
+        target = self.dir / "elsewhere" / "my stickers.db"
+        code, out, _ = self.cli("backup", str(target))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.stickers_in(target), 1)
+        self.assertEqual(list(target.parent.iterdir()), [target])
+
+        seed_sticker(self.db, 2, 2048)
+        kept = target.read_bytes()
+        code, _, err = self.cli("backup", str(target))
+        self.assertEqual(code, 1)
+        self.assertIn("already exists", err)
+        self.assertEqual(target.read_bytes(), kept)
+        self.assertEqual(list(target.parent.iterdir()), [target])
+        # Nor over the library itself, or anything else that is there.
+        code, _, err = self.cli("backup", str(self.db))
+        self.assertEqual(code, 1)
+        self.assertIn("already exists", err)
+        self.assertEqual(self.counts(), (2, 2))
+
+    def test_a_file_that_appears_meanwhile_is_not_written_over(self):
+        make_store(self.db)
+        target = self.dir / "copy.db"
+
+        def late(source, destination):
+            raise AssertionError("the copy must not be moved over {}".format(destination))
+
+        real_lexists = os.path.lexists
+        looks = []
+
+        def lexists(path):
+            if str(path) == str(target):
+                looks.append(path)
+                if len(looks) == 2:  # the look just before the copy gets its name
+                    target.write_bytes(b"someone else's file")
+            return real_lexists(path)
+
+        with mock.patch.object(imsticker.os.path, "lexists", side_effect=lexists), \
+                mock.patch.object(imsticker.os, "replace", side_effect=late):
+            code, _, err = self.cli("backup", str(target))
+        self.assertEqual(len(looks), 2)
+        self.assertEqual(code, 1)
+        self.assertIn("already exists", err)
+        self.assertEqual(target.read_bytes(), b"someone else's file")
+        self.assertEqual(sorted(path.name for path in self.dir.glob("copy.db*")), ["copy.db"])
+
+    def test_only_a_sticker_library_is_backed_up(self):
+        conn = sqlite3.connect(str(self.db))
+        conn.execute("create table notes (body text)")
+        conn.commit()
+        conn.close()
+        code, _, err = self.cli("backup")
+        self.assertEqual(code, 1)
+        self.assertIn("does not look like a sticker database", err)
+        self.assertFalse(self.backups.exists())
+
+    def test_a_copy_that_fails_the_check_is_kept_but_not_called_a_backup(self):
+        make_store(self.db)
+        with mock.patch.object(imsticker, "check_backup",
+                               side_effect=imsticker.ToolError("it is damaged (row 3 missing)")):
+            code, out, err = self.cli("backup")
+        self.assertEqual(code, 1)
+        self.assertIn("does not pass the check", err)
+        self.assertIn("it is damaged (row 3 missing)", err)
+        self.assertIn(str(self.by_hand()[0]), err)
+        self.assertNotIn("Backed up", out)
+
+    def test_what_is_still_in_the_write_ahead_log_is_in_the_copy(self):
+        make_store(self.db)
+        other = sqlite3.connect(str(self.db))  # stands in for stickersd
+        self.addCleanup(other.close)
+        self.assertEqual(other.execute("pragma journal_mode=wal").fetchone()[0], "wal")
+        other.execute("pragma wal_autocheckpoint=0")
+        other.execute("insert into ZMANAGEDSTICKER (Z_PK, Z_ENT, ZTYPE, ZIDENTIFIER) values (1, 2, 1, ?)",
+                      (uuid.uuid4().bytes,))
+        other.commit()
+        self.assertGreater(Path(str(self.db) + "-wal").stat().st_size, 0)
+        code, out, _ = self.cli("backup", str(self.dir / "copy.db"))
+        self.assertEqual(code, 0)
+        self.assertIn("Backed up 1 sticker (0 images, ", out)
+        # The copy stands on its own: no log of its own is left beside it.
+        self.assertEqual(sorted(path.name for path in self.dir.glob("copy.db*")), ["copy.db"])
+        self.assertEqual(self.stickers_in(self.dir / "copy.db"), 1)
+
+    def test_reading_a_backup_leaves_nothing_beside_it(self):
+        # A copy of a library that was in write-ahead-log mode says so in its
+        # own header. Checking it, counting what is in it and putting it back
+        # must not leave a log or an index next to it.
+        make_store(self.db)
+        conn = sqlite3.connect(str(self.db))
+        conn.execute("pragma journal_mode=wal")
+        conn.close()
+        seed_sticker(self.db, 1, 1024)
+        self.assertEqual(self.cli("backup")[0], 0)
+        saved = self.by_hand()[0]
+        self.assertEqual(saved.read_bytes()[18:20], b"\x02\x02")  # the header's log-mode mark
+        self.assertEqual(list(self.backups.iterdir()), [saved])
+        with mock.patch("builtins.input", return_value="n"):
+            self.assertEqual(self.cli("restore", str(saved))[0], 1)
+        self.assertEqual(list(self.backups.iterdir()), [saved])
+        seed_sticker(self.db, 2, 2048)
+        self.assertEqual(self.cli("restore", str(saved), "--yes")[0], 0)
+        self.assertEqual(self.counts(), (1, 1))
+        left = sorted(path.name for path in self.backups.iterdir() if path.name.startswith(saved.name))
+        self.assertEqual(left, [saved.name])
+
+    def test_a_backup_changed_after_it_was_made_is_read_with_its_log(self):
+        # Not something imsticker does, but if another program wrote to a
+        # backup and left a log beside it, what is in the log counts.
+        make_store(self.db)
+        conn = sqlite3.connect(str(self.db))
+        conn.execute("pragma journal_mode=wal")
+        conn.close()
+        self.assertEqual(self.cli("backup", str(self.dir / "copy.db"))[0], 0)
+        other = sqlite3.connect(str(self.dir / "copy.db"))
+        self.addCleanup(other.close)
+        other.execute("pragma wal_autocheckpoint=0")
+        other.execute("insert into ZMANAGEDSTICKER (Z_PK, Z_ENT, ZTYPE, ZIDENTIFIER) values (1, 2, 1, ?)",
+                      (uuid.uuid4().bytes,))
+        other.commit()
+        self.assertTrue(imsticker._has_log(self.dir / "copy.db"))
+        self.assertEqual(imsticker.library_counts(self.dir / "copy.db", backup=True), (1, 0))
+        self.assertEqual(self.cli("restore", str(self.dir / "copy.db"), "--yes")[0], 0)
+        self.assertEqual(self.counts(), (1, 0))
+
+    def test_the_library_is_not_a_backup_of_itself(self):
+        make_store(self.db)
+        seed_sticker(self.db, 1, 1024)
+        code, _, err = self.cli("restore", str(self.db), "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("is the sticker library itself", err)
+        self.assertEqual(self.counts(), (1, 1))
+        self.assertFalse(self.backups.exists())
+
+    def test_the_command_it_prints_names_a_library_chosen_by_the_environment(self):
+        make_store(self.db)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"IMSTICKER_DB": str(self.db)}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = imsticker.main(["backup"])
+        self.assertEqual((code, err.getvalue()), (0, ""))
+        command = [line.strip() for line in out.getvalue().splitlines() if " restore " in line]
+        self.assertEqual(shlex.split(command[0])[2:4], ["--db", os.path.abspath(str(self.db))])
+
+    def test_backup_is_a_command_word(self):
+        self.assertEqual(imsticker.with_default_command(["backup"]), ["backup"])
+        self.assertEqual(imsticker.with_default_command(["backup.png"]), ["add", "backup.png"])
 
 
 class ReadBack(StoreCase):

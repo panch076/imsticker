@@ -10,6 +10,11 @@
 #   3. Apple's own store code, run in this process on a copy, must return every
 #      imported sticker with its still and keyboard images, and the animation
 #      where there is one.
+#   4. `backup` copies the library while stickersd has it open. The copy must
+#      be a single file holding exactly what the library holds. Then one more
+#      sticker is imported and the backup is put back with `restore`: the
+#      library must again hold exactly what the backup holds, pass its
+#      integrity check, and be readable by Apple's own store code.
 #
 # What stickersd logs along the way is printed, not judged.
 set -euo pipefail
@@ -77,4 +82,51 @@ sqlite3 "$STORE" ".backup '$WORK/copy/stickers.stickerdb'"
 "$WORK/harness/exp_apple_store" "$WORK/copy/stickers.stickerdb" fetch $(cat "$WORK/imported.txt") > "$WORK/fetch.txt"
 grep -v "description = " "$WORK/fetch.txt"
 "$PY" ci/real_library.py fetched "$WORK/fetch.txt" "$WORK/imported.txt" "$ANIMATED"
+echo "::endgroup::"
+
+# A backup is one file. Reading it must not leave a half-written copy, or a
+# log or an index of SQLite's, beside it.
+only_the_backup() {
+    local found
+    found=$(find "$WORK/backups" -name "*.manual*")
+    if [ "$(printf '%s\n' "$found" | wc -l | tr -d ' ')" != 1 ] || [ "$found" != "$KEPT" ]; then
+        echo "::error title=Stray files beside the backup::expected only $KEPT, found: $found"
+        exit 1
+    fi
+}
+
+echo "::group::4. a backup made by hand, and putting it back"
+"$PY" imsticker.py backup | tee "$WORK/backup.txt"
+KEPT=$(find "$WORK/backups" -name "*.manual")
+[ -f "$KEPT" ]
+only_the_backup
+# The command it prints for putting the backup back must name that file.
+grep -F -- " restore " "$WORK/backup.txt" | grep -F -- "$KEPT"
+"$PY" ci/real_library.py same "$STORE" "$KEPT"
+
+echo "--- one more sticker, so that the library and the backup differ:"
+"$PY" imsticker.py add --no-restart --max-edge 256 --name "after the backup" "$F/still.png"
+"$PY" ci/real_library.py check "$STORE" "$WORK/before.json" "$WORK/with-one-more.txt" "$((IMPORTS + 1))"
+
+echo "--- the backup put back by name:"
+"$PY" imsticker.py restore "$KEPT" --yes
+only_the_backup
+start_daemon
+pgrep -lf stickersd || true
+"$PY" ci/real_library.py same "$STORE" "$KEPT"
+"$PY" ci/real_library.py check "$STORE" "$WORK/before.json" "$WORK/restored.txt" "$IMPORTS"
+cmp "$WORK/imported.txt" "$WORK/restored.txt"
+INTEGRITY=$(sqlite3 "$STORE" "pragma integrity_check")
+echo "integrity check: $INTEGRITY"
+[ "$INTEGRITY" = ok ]
+
+echo "--- Apple's own store code reads the restored library (on a copy):"
+sqlite3 "$STORE" ".backup '$WORK/copy/restored.stickerdb'"
+# shellcheck disable=SC2046
+"$WORK/harness/exp_apple_store" "$WORK/copy/restored.stickerdb" fetch $(cat "$WORK/restored.txt") > "$WORK/fetch-restored.txt"
+grep -v "description = " "$WORK/fetch-restored.txt"
+"$PY" ci/real_library.py fetched "$WORK/fetch-restored.txt" "$WORK/restored.txt" "$ANIMATED"
+echo "--- error-level lines from the sticker system since the restore (printed, not judged):"
+log show --last 1m --style compact --predicate 'subsystem BEGINSWITH "com.apple.stickers" AND messageType == error' 2>/dev/null \
+    | grep -v "legacy data store" | cut -c1-200 | sort -k5 | uniq -c -f4 | tail -12 || true
 echo "::endgroup::"

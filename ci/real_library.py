@@ -12,16 +12,29 @@ ci/verify_real_library.sh.
         Fail unless Apple's store code returned every imported sticker with
         its still and keyboard images, and the animation for the last
         <animated count> of them.
+    real_library.py same <store> <backup>
+        Fail unless the library and a backup of it hold the same stickers,
+        with the same images byte for byte, the backup passes SQLite's full
+        integrity check, and the library's history has lost nothing the
+        backup's has.
 """
+import hashlib
 import json
+import pathlib
 import re
 import sqlite3
 import sys
 import uuid
 
 
-def connect(path):
-    conn = sqlite3.connect(path, timeout=20)
+def connect(path, backup=False):
+    if backup:
+        # A backup is one complete file. Read as such, SQLite makes no log or
+        # index beside it, so this check leaves the folder as it found it.
+        uri = pathlib.Path(path).resolve().as_uri() + "?mode=ro&immutable=1"
+        conn = sqlite3.connect(uri, uri=True, timeout=20)
+    else:
+        conn = sqlite3.connect(path, timeout=20)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -107,6 +120,47 @@ def fetched(fetch_path, imported_path, animated_count):
     print("Apple's store code returned all {} imported stickers".format(len(imported)))
 
 
+def contents(path, backup=False):
+    """Every sticker in a library by identifier, with a digest of each of its
+    images; how much history it has; and what SQLite's integrity check says."""
+    conn = connect(path, backup)
+    try:
+        stickers = {}
+        for row in conn.execute("select Z_PK, ZIDENTIFIER from ZMANAGEDSTICKER").fetchall():
+            identifier = str(uuid.UUID(bytes=bytes(row["ZIDENTIFIER"]))).upper()
+            assert identifier not in stickers, "two stickers share the identifier " + identifier
+            stickers[identifier] = sorted(
+                (image["ZROLE"], image["ZUTI"], hashlib.sha256(bytes(image["ZDATA"] or b"")).hexdigest())
+                for image in conn.execute(
+                    "select ZROLE, ZUTI, ZDATA from ZMANAGEDREPRESENTATION where ZSTICKER = ?",
+                    (row["Z_PK"],)).fetchall())
+        history = tuple(
+            conn.execute("select count(*) from " + table).fetchone()[0]
+            for table in ("ATRANSACTION", "ACHANGE"))
+        integrity = conn.execute("pragma integrity_check").fetchone()[0]
+    finally:
+        conn.close()
+    return stickers, history, integrity
+
+
+def same(store, backup):
+    in_store, store_history, _ = contents(store)
+    in_backup, backup_history, integrity = contents(backup, backup=True)
+    assert integrity == "ok", "the backup fails SQLite's integrity check: " + integrity
+    assert in_backup, "the backup holds no stickers, so comparing it would show nothing"
+    assert sorted(in_store) == sorted(in_backup), "different stickers: library {} / backup {}".format(
+        sorted(in_store), sorted(in_backup))
+    for identifier in sorted(in_store):
+        assert in_store[identifier] == in_backup[identifier], "the images of {} differ".format(identifier)
+    assert all(have >= kept for have, kept in zip(store_history, backup_history)), (
+        "the library's history {} is missing some of the backup's {}".format(store_history, backup_history))
+    images = sum(len(found) for found in in_backup.values())
+    print("library and backup hold the same {} stickers and {} images, byte for byte".format(
+        len(in_backup), images))
+    print("history (saves, changes): library {}, backup {}; backup integrity check: {}".format(
+        store_history, backup_history, integrity))
+
+
 def main():
     command = sys.argv[1]
     if command == "snapshot":
@@ -115,6 +169,8 @@ def main():
         check(sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]))
     elif command == "fetched":
         fetched(sys.argv[2], sys.argv[3], int(sys.argv[4]))
+    elif command == "same":
+        same(sys.argv[2], sys.argv[3])
     else:
         raise SystemExit("unknown command " + command)
 

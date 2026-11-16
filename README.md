@@ -47,7 +47,8 @@ stops the command before anything is imported.
 | `add FILE...` | Import images. An animated GIF or APNG becomes an animated sticker with its own frame timing. |
 | `list -v` | Show every sticker in the library and each image stored for it. |
 | `export DIR` | Write the stored images out as files. |
-| `restore` | Put back the backup taken before the last import. The library as it was just before the restore is kept too. |
+| `backup` | Save a copy of the whole library now. `backup FOLDER` or `backup NEW-FILE` puts the copy where you say; it never writes over a file that is already there. |
+| `restore` | Put back the backup taken before the last import. `restore FILE` puts back any backup by name. The library as it was just before the restore is kept too. |
 
 Options for `add`:
 
@@ -63,7 +64,18 @@ Options for `add`:
 | `--no-restart` | Do not restart `stickersd` afterwards. |
 
 A backup of the library is made before every import, in
-`~/Library/Application Support/imsticker/Backups`.
+`~/Library/Application Support/imsticker/Backups`, and `backup` makes one
+whenever you ask:
+
+```bash
+python3 imsticker.py backup
+```
+
+It prints where the copy went and the command that puts it back. A plain
+`restore` only ever undoes the last import, so a backup you made yourself is
+put back by name, with that command. Each backup is a complete copy of the
+library in one file, taken while `stickersd` is running. imsticker never
+deletes one, so clear old ones out of that folder yourself.
 
 Animated stickers need a Mac on which ImageIO can write an HEIF image sequence.
 In the checks here GitHub's Intel runner could and its Apple-silicon runners
@@ -101,6 +113,7 @@ is normal is not known.
 | That Messages shows and sends them | No way to drive the Messages window on a build machine. [StickerHack](https://github.com/AdamEXu/StickerHack) users report that stickers written as SQL rows appear and send. |
 | That they reach your iPhone | The build machines have no iCloud account, so `stickersd` never gets as far as uploading, whichever way the stickers were written. StickerHack's README says its stickers do sync. The default route here also records the save in the history that Core Data's iCloud mirroring works from; whether that makes a difference was not tested. |
 | A library that already holds stickers made by Apple's software, or that has synced | Each build machine's library starts empty. The only stickers in it during an import are ones this tool has just added. |
+| What a restore does on a Mac that syncs its stickers | A restore puts the whole database back as it was when the backup was made, Apple's sync bookkeeping included. With no iCloud account on the build machines, what iCloud then does about stickers added or deleted since the backup was not tested. |
 | An animation made on Apple silicon, or on macOS 26 | ImageIO on GitHub's Apple-silicon runners could not write one. It needs a physical Mac, and none was tested. |
 | What macOS's privacy protection does on your own Mac | On the build machines nothing stood between a terminal and the library. On your Mac macOS may ask first, or refuse. The message imsticker gives for a refusal was only exercised by simulating one in the unit tests. |
 | macOS 15.1, where the library is in another place | No build machine runs it. Only the unit tests cover it, on stand-in files. |

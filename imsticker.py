@@ -16,6 +16,7 @@ line tools installed (`python3`, `swift`).
     python3 imsticker.py add cat.png party.gif wave.apng
     python3 imsticker.py list -v
     python3 imsticker.py export ./dump
+    python3 imsticker.py backup
     python3 imsticker.py restore
 
 Written for Python 3.9 (what Apple ships) and the standard library only.
@@ -33,6 +34,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -91,7 +93,15 @@ EXTENSIONS = {
     "public.jpeg": ".jpg",
 }
 
-COMMANDS = ("add", "list", "export", "restore")
+COMMANDS = ("add", "list", "export", "backup", "restore")
+
+# How the backups in imsticker's own folder are told apart, by the last part of
+# their names. A plain `restore` only ever picks one made before an import; the
+# others are put back by name.
+BEFORE_IMPORT = "backup"
+BY_HAND = "manual"
+BEFORE_RESTORE = "before-restore"
+NOT_IMPORTED = "not-imported"
 
 
 class ToolError(Exception):
@@ -111,16 +121,27 @@ ACCESS_HINT = (
 )
 
 
-def _is_file(path):
-    """Whether a file is there. Asked with os.stat rather than Path.is_file so
-    that being refused is told apart from the file not existing."""
+def _mode(path):
+    """What is at a path: its st_mode, or None for nothing. Asked with os.stat
+    rather than Path.is_file and its kin, so that being refused is told apart
+    from nothing being there."""
     try:
-        return stat.S_ISREG(os.stat(str(path)).st_mode)
+        return os.stat(str(path)).st_mode
     except PermissionError as exc:
         raise ToolError("macOS did not allow access to {} ({}).\n{}".format(
             path, exc.strerror or exc, ACCESS_HINT))
     except (OSError, ValueError):
-        return False
+        return None
+
+
+def _is_file(path):
+    mode = _mode(path)
+    return mode is not None and stat.S_ISREG(mode)
+
+
+def _is_dir(path):
+    mode = _mode(path)
+    return mode is not None and stat.S_ISDIR(mode)
 
 
 def _last_write(path):
@@ -157,12 +178,33 @@ def find_db(explicit=None, home=None):
     return found[0]
 
 
-def connect(path, readonly=False):
+def _has_log(path):
+    """Whether a write-ahead log with something in it lies beside a database."""
+    try:
+        return os.stat(str(path) + "-wal").st_size > 0
+    except OSError:
+        return False
+
+
+def connect(path, readonly=False, backup=False):
+    """Open a library, or with `backup` a backup of one, which is only read.
+
+    A backup is one complete file, and SQLite is told so (`immutable`): it
+    then reads that file and touches nothing else. Opened the ordinary way, a
+    copy of a library that was in write-ahead-log mode has a log and an index
+    made beside it, and they can be left behind. If a log with something in it
+    is there all the same, the file was changed after it was made, and
+    SQLite's ordinary rules apply to it.
+    """
+    readonly = readonly or backup
     attempts = [(str(path), False)]
     if readonly:
         # A read-only open can fail on a write-ahead-log store with no -shm file
         # yet; the plain open that follows still only reads.
-        attempts.insert(0, (Path(path).resolve().as_uri() + "?mode=ro", True))
+        uri = Path(path).resolve().as_uri()
+        attempts.insert(0, (uri + "?mode=ro", True))
+        if backup and not _has_log(path):
+            attempts.insert(0, (uri + "?mode=ro&immutable=1", True))
     error = None
     for target, is_uri in attempts:
         conn = None
@@ -192,15 +234,22 @@ def library_tag(db_path):
     return hashlib.sha1(str(Path(db_path).resolve()).encode("utf-8")).hexdigest()[:8]
 
 
-def backup_db(db_path, directory, kind="backup"):
+def backup_db(db_path, directory, kind=BEFORE_IMPORT, target=None):
     """Snapshot the store with SQLite's backup API (safe while stickersd has it open).
 
     The file only gets its final name once it is complete, so a backup that
-    failed part-way can never be mistaken for a good one.
+    failed part-way can never be mistaken for a good one. With `target` the
+    copy goes to exactly that file, which must not exist yet: a backup is never
+    written over anything.
     """
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
-    target = directory / "stickers.stickerdb.{}.{}.{}".format(library_tag(db_path), stamp, kind)
-    partial = Path(str(target) + ".partial")
+    named = target is not None
+    if named:
+        directory = target.parent
+        partial = Path("{}.{}.partial".format(target, uuid.uuid4().hex[:8]))
+    else:
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        target = directory / "stickers.stickerdb.{}.{}.{}".format(library_tag(db_path), stamp, kind)
+        partial = Path(str(target) + ".partial")
     failure = None
     opened = []
     try:
@@ -215,20 +264,41 @@ def backup_db(db_path, directory, kind="backup"):
     finally:
         for connection in reversed(opened):
             connection.close()
+    if failure is None:
+        try:
+            if named and os.path.lexists(str(target)):
+                raise FileExistsError("{} already exists".format(target))
+            os.replace(str(partial), str(target))
+        except OSError as exc:
+            failure = exc
     if failure is not None:
         try:
             partial.unlink()
         except OSError:
             pass
         raise ToolError("Could not back up the library, so nothing was changed: {}".format(failure))
-    os.replace(str(partial), str(target))
     return target
+
+
+def library_counts(path, backup=False):
+    """How many stickers and images a sticker library, or a backup of one, holds."""
+    conn = connect(path, readonly=True, backup=backup)
+    try:
+        if not table_info(conn, STICKER_TABLE) or not table_info(conn, REP_TABLE):
+            raise ToolError("This does not look like a sticker database: {}".format(path))
+        return tuple(
+            conn.execute("select count(*) from {}".format(table)).fetchone()[0]
+            for table in (STICKER_TABLE, REP_TABLE))
+    except sqlite3.Error as exc:
+        raise ToolError("This does not look like a sticker database: {} ({})".format(path, exc))
+    finally:
+        conn.close()
 
 
 def check_backup(path):
     """Refuse to restore anything that is not an intact copy of a sticker library."""
     try:
-        conn = connect(path, readonly=True)
+        conn = connect(path, backup=True)
     except ToolError:
         raise ToolError("{} is not a backup of a sticker library.".format(path))
     try:
@@ -603,6 +673,12 @@ def _kb(count):
     return "{:.1f} KB".format(count / 1024.0)
 
 
+def _size(count):
+    if count >= 1024 * 1024:
+        return "{:.1f} MB".format(count / 1048576.0)
+    return _kb(count)
+
+
 def main_image(encoded):
     """The image a sticker is shown and sent as: the animation, or else the still."""
     preferred = [rep for rep in encoded["representations"] if rep["preferred"]]
@@ -728,7 +804,7 @@ def cmd_add(args):
             # Nothing was imported, so this is not a backup "from before an
             # import". Take it out of what a plain `restore` would offer.
             try:
-                os.replace(str(backup), str(backup)[:-len("backup")] + "not-imported")
+                os.replace(str(backup), str(backup)[:-len(BEFORE_IMPORT)] + NOT_IMPORTED)
             except OSError:
                 pass
             raise
@@ -860,22 +936,84 @@ def cmd_export(args):
     return 0
 
 
+def _restore_command(db_arg, backup):
+    """The command that puts a backup back, ready to paste into a shell. It
+    names the library too if this run was pointed at one, so that the backup
+    goes back to where it came from."""
+    db_arg = db_arg or os.environ.get("IMSTICKER_DB")
+    words = ["python3", "imsticker.py"]
+    if db_arg:
+        words += ["--db", os.path.abspath(os.path.expanduser(str(db_arg)))]
+    words += ["restore", os.path.abspath(str(backup))]
+    return " ".join(shlex.quote(word) for word in words)
+
+
+def cmd_backup(args):
+    db_path = find_db(args.db)
+    print("Sticker library: {}".format(db_path))
+    library_counts(db_path)  # so that only a sticker library is ever backed up
+    directory, target = backup_dir(), None
+    if args.dest:
+        chosen = Path(args.dest).expanduser()
+        if _is_dir(chosen) or args.dest.endswith(("/", os.sep)):
+            directory = chosen
+        elif os.path.lexists(str(chosen)):
+            raise ToolError(
+                "{} already exists. A backup is never written over another file: "
+                "give a new name, or a folder.".format(chosen))
+        else:
+            target = chosen
+    saved = backup_db(db_path, directory, kind=BY_HAND, target=target)
+    try:
+        check_backup(saved)
+        stickers, images = library_counts(saved, backup=True)
+    except ToolError as exc:
+        raise ToolError(
+            "The copy was written to {}\nbut it does not pass the check `restore` makes of a "
+            "backup, so the library itself may be damaged: {}".format(saved, exc))
+    print("Backed up {} sticker{} ({} image{}, {}) to\n  {}".format(
+        stickers, "" if stickers == 1 else "s", images, "" if images == 1 else "s",
+        _size(saved.stat().st_size), saved))
+    print("To put it back later:\n  {}".format(_restore_command(args.db, saved)))
+    return 0
+
+
 def cmd_restore(args):
     db_path = find_db(args.db)
+    newer_by_hand = None
     if args.backup:
         chosen = Path(args.backup).expanduser()
     else:
-        # Only backups made before an import of this very library; the copies
-        # that restore itself makes are named differently and are not offered.
-        available = sorted(backup_dir().glob("stickers.stickerdb.{}.*.backup".format(library_tag(db_path))))
+        # Only backups made before an import of this very library. The copies
+        # that restore itself makes, and the ones made with `backup`, are named
+        # differently and are put back by name.
+        names = "stickers.stickerdb.{}.*.{{}}".format(library_tag(db_path))
+        available = sorted(backup_dir().glob(names.format(BEFORE_IMPORT)))
+        by_hand = sorted(backup_dir().glob(names.format(BY_HAND)))
+        if not available and by_hand:
+            raise ToolError(
+                "No backup from before an import of this library in {}.\n"
+                "One made with `backup` is put back by name. The newest is:\n  {}".format(
+                    backup_dir(), _restore_command(args.db, by_hand[-1])))
         if not available:
             raise ToolError("No backups of this library found in {}".format(backup_dir()))
         chosen = available[-1]
-    if not chosen.is_file():
+        if by_hand and by_hand[-1].name > chosen.name:
+            newer_by_hand = by_hand[-1]
+    if not _is_file(chosen):
         raise ToolError("No backup at {}".format(chosen))
+    try:
+        itself = os.path.samefile(str(chosen), str(db_path))
+    except OSError:
+        itself = False
+    if itself:
+        raise ToolError("{} is the sticker library itself, not a backup of it.".format(chosen))
     check_backup(chosen)
 
     print("This replaces the sticker library\n  {}\nwith the backup\n  {}".format(db_path, chosen))
+    if newer_by_hand is not None:
+        print("That is the one from before the last import. A newer one, made with `backup`, "
+              "is put back by name:\n  {}".format(_restore_command(args.db, newer_by_hand)))
     if not args.yes:
         try:
             answer = input("Stickers added since that backup will be gone. Continue? [y/N] ")
@@ -884,16 +1022,18 @@ def cmd_restore(args):
         if answer.strip().lower() != "y":
             print("Left the library alone.")
             return 1
-    safety = backup_db(db_path, backup_dir(), kind="before-restore")
+    safety = backup_db(db_path, backup_dir(), kind=BEFORE_RESTORE)
     restart_stickersd()
-    source = sqlite3.connect(str(chosen))
-    destination = sqlite3.connect(str(db_path), timeout=10)
+    source = connect(chosen, backup=True)
     try:
-        source.backup(destination)
-    except sqlite3.Error as exc:
-        raise ToolError("Restore failed: {}".format(exc))
+        destination = sqlite3.connect(str(db_path), timeout=10)
+        try:
+            source.backup(destination)
+        except sqlite3.Error as exc:
+            raise ToolError("Restore failed: {}".format(exc))
+        finally:
+            destination.close()
     finally:
-        destination.close()
         source.close()
     restart_stickersd()
     print("Restored. The library as it was a moment ago is saved at {}\n"
@@ -939,8 +1079,15 @@ def build_parser():
     export.add_argument("--sticker", type=int, help="only this sticker number (see list)")
     export.set_defaults(run=cmd_export)
 
-    restore = commands.add_parser("restore", help="put back a backup made before an import")
-    restore.add_argument("backup", nargs="?", help="backup file (default: the newest one)")
+    backup = commands.add_parser("backup", help="save a copy of the sticker library")
+    backup.add_argument("dest", nargs="?",
+                        help="a new file, or a folder, to write the copy to "
+                             "(default: imsticker's own backup folder)")
+    backup.set_defaults(run=cmd_backup)
+
+    restore = commands.add_parser("restore", help="put a backup of the sticker library back")
+    restore.add_argument("backup", nargs="?",
+                         help="backup file (default: the one made before the last import)")
     restore.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     restore.set_defaults(run=cmd_restore)
     return parser
