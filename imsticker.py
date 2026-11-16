@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -162,19 +163,58 @@ def backup_dir(home=None):
     return home.joinpath(*BACKUP_PARTS)
 
 
-def backup_db(db_path, directory):
-    """Snapshot the store with SQLite's backup API (safe while stickersd has it open)."""
+def library_tag(db_path):
+    """A short name for one library, so its backups are never offered to another."""
+    return hashlib.sha1(str(Path(db_path).resolve()).encode("utf-8")).hexdigest()[:8]
+
+
+def backup_db(db_path, directory, kind="backup"):
+    """Snapshot the store with SQLite's backup API (safe while stickersd has it open).
+
+    The file only gets its final name once it is complete, so a backup that
+    failed part-way can never be mistaken for a good one.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
-    target = directory / "stickers.stickerdb.{}.backup".format(stamp)
+    target = directory / "stickers.stickerdb.{}.{}.{}".format(library_tag(db_path), stamp, kind)
+    partial = Path(str(target) + ".partial")
+    failure = None
     source = sqlite3.connect(str(db_path), timeout=10)
-    destination = sqlite3.connect(str(target))
+    destination = sqlite3.connect(str(partial))
     try:
         source.backup(destination)
+    except sqlite3.Error as exc:
+        failure = exc
     finally:
         destination.close()
         source.close()
+    if failure is not None:
+        try:
+            partial.unlink()
+        except OSError:
+            pass
+        raise ToolError("Could not back up the library, so nothing was changed: {}".format(failure))
+    os.replace(str(partial), str(target))
     return target
+
+
+def check_backup(path):
+    """Refuse to restore anything that is not an intact copy of a sticker library."""
+    try:
+        conn = connect(path, readonly=True)
+    except ToolError:
+        raise ToolError("{} is not a backup of a sticker library.".format(path))
+    try:
+        tables = set(row[0] for row in conn.execute("select name from sqlite_master where type = 'table'"))
+        verdict = conn.execute("pragma quick_check").fetchone()[0]
+    except sqlite3.Error as exc:
+        raise ToolError("{} cannot be read as a backup: {}".format(path, exc))
+    finally:
+        conn.close()
+    if not {STICKER_TABLE, REP_TABLE, "Z_PRIMARYKEY"} <= tables:
+        raise ToolError("{} is not a backup of a sticker library.".format(path))
+    if verdict != "ok":
+        raise ToolError("{} is damaged ({}).".format(path, verdict))
 
 
 def restart_stickersd():
@@ -513,8 +553,10 @@ def encode_within_budget(command, source, work_dir, max_edge, resample, no_upsca
     """
     edges = [max_edge] + [edge for edge in SHRINK_STEPS if edge < max_edge]
     encoded = None
-    previous_size = None
+    produced = None  # longest side of what the last attempt came out as
     for edge in edges:
+        if produced is not None and edge >= produced:
+            continue  # with --no-upscale on a small source this would come out no smaller
         out_dir = Path(work_dir) / "edge-{}".format(edge)
         out_dir.mkdir(parents=True, exist_ok=True)
         encoded = run_encoder(command, source, out_dir, edge, resample, no_upscale, animation_only)
@@ -524,10 +566,7 @@ def encode_within_budget(command, source, work_dir, max_edge, resample, no_upsca
         encoded["overBudget"] = bool(max_bytes) and heaviest["byteCount"] > max_bytes
         if not encoded["overBudget"]:
             break
-        size = (heaviest["width"], heaviest["height"])
-        if size == previous_size:  # --no-upscale and already at the source size
-            break
-        previous_size = size
+        produced = max(heaviest["width"], heaviest["height"])
     return encoded
 
 
@@ -777,12 +816,15 @@ def cmd_restore(args):
     if args.backup:
         chosen = Path(args.backup).expanduser()
     else:
-        available = sorted(backup_dir().glob("stickers.stickerdb.*.backup"))
+        # Only backups made before an import of this very library; the copies
+        # that restore itself makes are named differently and are not offered.
+        available = sorted(backup_dir().glob("stickers.stickerdb.{}.*.backup".format(library_tag(db_path))))
         if not available:
-            raise ToolError("No backups found in {}".format(backup_dir()))
+            raise ToolError("No backups of this library found in {}".format(backup_dir()))
         chosen = available[-1]
     if not chosen.is_file():
         raise ToolError("No backup at {}".format(chosen))
+    check_backup(chosen)
 
     print("This replaces the sticker library\n  {}\nwith the backup\n  {}".format(db_path, chosen))
     if not args.yes:
@@ -793,7 +835,7 @@ def cmd_restore(args):
         if answer.strip().lower() != "y":
             print("Left the library alone.")
             return 1
-    safety = backup_db(db_path, backup_dir())
+    safety = backup_db(db_path, backup_dir(), kind="before-restore")
     restart_stickersd()
     source = sqlite3.connect(str(chosen))
     destination = sqlite3.connect(str(db_path), timeout=10)
@@ -805,7 +847,8 @@ def cmd_restore(args):
         destination.close()
         source.close()
     restart_stickersd()
-    print("Restored. The library as it was a moment ago is saved at {}".format(safety))
+    print("Restored. The library as it was a moment ago is saved at {}\n"
+          "(to go back to it: restore that file by name)".format(safety))
     return 0
 
 
@@ -995,14 +1038,18 @@ func fitSize(width: Int, height: Int, maxEdge: Int, upscale: Bool) -> (Int, Int)
 }
 
 // Draws the whole frame, alpha included, into a clear canvas. Nothing is masked.
-func render(_ image: CGImage, width: Int, height: Int, smooth: Bool) -> CGImage {
+// The canvas may be a pixel wider or taller than the picture, which then sits
+// at its top left with the spare pixel left transparent.
+func render(_ image: CGImage, width: Int, height: Int, smooth: Bool, canvasWidth: Int? = nil, canvasHeight: Int? = nil) -> CGImage {
+    let fullWidth = canvasWidth ?? width
+    let fullHeight = canvasHeight ?? height
     guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
         die("cannot create the sRGB color space")
     }
     guard let context = CGContext(
         data: nil,
-        width: width,
-        height: height,
+        width: fullWidth,
+        height: fullHeight,
         bitsPerComponent: 8,
         bytesPerRow: 0,
         space: colorSpace,
@@ -1010,10 +1057,10 @@ func render(_ image: CGImage, width: Int, height: Int, smooth: Bool) -> CGImage 
     ) else {
         die("cannot create a bitmap context")
     }
-    let bounds = CGRect(x: 0, y: 0, width: width, height: height)
-    context.clear(bounds)
+    context.clear(CGRect(x: 0, y: 0, width: fullWidth, height: fullHeight))
     context.interpolationQuality = smooth ? .high : .none
-    context.draw(image, in: bounds)
+    // Core Graphics counts rows from the bottom, so this is the top left.
+    context.draw(image, in: CGRect(x: 0, y: fullHeight - height, width: width, height: height))
     guard let rendered = context.makeImage() else {
         die("cannot render the image")
     }
@@ -1050,15 +1097,14 @@ func frameDelay(_ source: CGImageSource, _ index: Int) -> Double {
     return 0.1
 }
 
-func writeHEIC(_ image: CGImage, to url: URL) {
+// Returns false if ImageIO would not write it (a picture one pixel across, say).
+func writeHEIC(_ image: CGImage, to url: URL) -> Bool {
     guard let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.heic" as CFString, 1, nil) else {
-        die("cannot create an HEIC writer")
+        return false
     }
     let properties: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.9]
     CGImageDestinationAddImage(destination, image, properties as CFDictionary)
-    if !CGImageDestinationFinalize(destination) {
-        die("failed to write \(url.path)")
-    }
+    return CGImageDestinationFinalize(destination)
 }
 
 func encodeStill(source: CGImageSource, options: Options, outputDir: URL) -> Output {
@@ -1085,7 +1131,12 @@ func encodeStill(source: CGImageSource, options: Options, outputDir: URL) -> Out
         )
         let rendered = render(image, width: width, height: height, smooth: smooth)
         let url = outputDir.appendingPathComponent("rep-\(index).heic")
-        writeHEIC(rendered, to: url)
+        if !writeHEIC(rendered, to: url) {
+            if spec.preferred {
+                die("failed to write \(url.path)")
+            }
+            continue  // a smaller size the system can do without
+        }
         representations.append(Representation(
             role: spec.role,
             uti: "public.heic",
@@ -1111,14 +1162,15 @@ func encodeAnimated(source: CGImageSource, frameCount: Int, isGIF: Bool, options
     guard let first = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
         die("cannot decode the first frame")
     }
+    let (drawWidth, drawHeight) = fitSize(width: first.width, height: first.height, maxEdge: options.maxEdge, upscale: options.upscale)
+    // The sequence is HEVC video underneath and needs even sides. Pad an odd
+    // side with one transparent pixel rather than squeezing the picture.
+    let width = drawWidth + drawWidth % 2
+    let height = drawHeight + drawHeight % 2
     var smooth = options.resample != "nearest"
-    if options.resample == "auto" && isGIF && max(first.width, first.height) <= 256 {
-        smooth = false
+    if options.resample == "auto" && isGIF && max(first.width, first.height) <= 256 && drawWidth >= first.width {
+        smooth = false  // a small GIF being enlarged: keep its pixels crisp
     }
-    let (fittedWidth, fittedHeight) = fitSize(width: first.width, height: first.height, maxEdge: options.maxEdge, upscale: options.upscale)
-    // The sequence is HEVC video underneath, so keep both sides even.
-    let width = max(2, fittedWidth - fittedWidth % 2)
-    let height = max(2, fittedHeight - fittedHeight % 2)
     // Which source frame goes where, and for how long.
     var frames: [Int] = []
     var delays: [Double] = []
@@ -1150,7 +1202,7 @@ func encodeAnimated(source: CGImageSource, frameCount: Int, isGIF: Bool, options
         guard let frame = CGImageSourceCreateImageAtIndex(source, index, nil) else {
             die("cannot decode frame \(index)")
         }
-        let rendered = render(frame, width: width, height: height, smooth: smooth)
+        let rendered = render(frame, width: drawWidth, height: drawHeight, smooth: smooth, canvasWidth: width, canvasHeight: height)
         let frameProperties: [CFString: Any] = [
             kCGImagePropertyHEICSDictionary: [kCGImagePropertyHEICSDelayTime: delays[position]],
             kCGImageDestinationLossyCompressionQuality: 0.85
@@ -1166,30 +1218,33 @@ func encodeAnimated(source: CGImageSource, frameCount: Int, isGIF: Bool, options
         // A still of the first frame and a small keyboard preview, the two
         // roles the system uses wherever a sticker is shown without moving.
         let stillURL = outputDir.appendingPathComponent("rep-0.heic")
-        writeHEIC(render(first, width: width, height: height, smooth: smooth), to: stillURL)
-        representations.append(Representation(
-            role: "com.apple.stickers.role.still",
-            uti: "public.heic",
-            width: width,
-            height: height,
-            byteCount: byteCount(stillURL),
-            preferred: false,
-            index: 0,
-            path: stillURL.path
-        ))
+        let still = render(first, width: drawWidth, height: drawHeight, smooth: smooth, canvasWidth: width, canvasHeight: height)
+        if writeHEIC(still, to: stillURL) {
+            representations.append(Representation(
+                role: "com.apple.stickers.role.still",
+                uti: "public.heic",
+                width: width,
+                height: height,
+                byteCount: byteCount(stillURL),
+                preferred: false,
+                index: 0,
+                path: stillURL.path
+            ))
+        }
         let (previewWidth, previewHeight) = fitSize(width: first.width, height: first.height, maxEdge: 100, upscale: false)
         let previewURL = outputDir.appendingPathComponent("rep-1.heic")
-        writeHEIC(render(first, width: previewWidth, height: previewHeight, smooth: smooth), to: previewURL)
-        representations.append(Representation(
-            role: "com.apple.stickers.role.keyboard",
-            uti: "public.heic",
-            width: previewWidth,
-            height: previewHeight,
-            byteCount: byteCount(previewURL),
-            preferred: false,
-            index: 1,
-            path: previewURL.path
-        ))
+        if writeHEIC(render(first, width: previewWidth, height: previewHeight, smooth: true), to: previewURL) {
+            representations.append(Representation(
+                role: "com.apple.stickers.role.keyboard",
+                uti: "public.heic",
+                width: previewWidth,
+                height: previewHeight,
+                byteCount: byteCount(previewURL),
+                preferred: false,
+                index: 1,
+                path: previewURL.path
+            ))
+        }
     }
     representations.append(Representation(
         role: "com.apple.stickers.role.animated",

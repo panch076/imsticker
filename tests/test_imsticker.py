@@ -346,8 +346,17 @@ class AddAnimated(StoreCase):
         make_store(self.db)
         code, out, _ = self.cli("add", self.source("anim.gif"), "--no-upscale", "--max-bytes", "1000")
         self.assertEqual(code, 0)
-        self.assertIn("animated 200x200", out)
+        # It went all the way down to the smallest size it tries before giving up.
+        self.assertIn("animated 128x128", out)
         self.assertIn("still heavy", out)
+
+    def test_shrinks_below_the_source_size_when_not_enlarging(self):
+        # The stand-in source is 200 px wide: 200 px is 160 KB, 192 px is 147 KB, 160 px is 102 KB.
+        make_store(self.db)
+        code, out, _ = self.cli("add", self.source("anim.gif"), "--no-upscale", "--max-bytes", "120000")
+        self.assertEqual(code, 0)
+        self.assertIn("animated 160x160", out)
+        self.assertNotIn("still heavy", out)
 
     def test_wrong_container_changes_nothing(self):
         make_store(self.db)
@@ -431,10 +440,55 @@ class BackupRestore(StoreCase):
         code, out, _ = self.cli("restore", "--yes")
         self.assertEqual(code, 0)
         self.assertEqual(self.counts(), (1, 1))
-        # The state just before the restore was kept too, so it can be undone.
-        backups = sorted(self.backups.glob("stickers.stickerdb.*.backup"))
-        self.assertEqual(len(backups), 2)
-        self.assertEqual(rows(backups[-1], "select count(*) from ZMANAGEDSTICKER")[0][0], 2)
+        # The state just before the restore was kept too, under another name,
+        # so it can be put back by hand but is never picked by a plain restore.
+        self.assertEqual(len(list(self.backups.glob("*.backup"))), 1)
+        kept = list(self.backups.glob("*.before-restore"))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(rows(kept[0], "select count(*) from ZMANAGEDSTICKER")[0][0], 2)
+        self.assertEqual(list(self.backups.glob("*.partial")), [])
+
+        # A second plain restore goes back to the same pre-import state again.
+        self.assertEqual(self.cli("restore", "--yes")[0], 0)
+        self.assertEqual(self.counts(), (1, 1))
+        # And the kept copy can be restored by name.
+        self.assertEqual(self.cli("restore", str(kept[0]), "--yes")[0], 0)
+        self.assertEqual(self.counts(), (2, 8))
+
+    def test_restore_refuses_a_file_that_is_not_a_library(self):
+        make_store(self.db)
+        self.assertEqual(self.cli("add", self.source("cat.png"))[0], 0)
+        other = self.dir / "notes.db"
+        conn = sqlite3.connect(str(other))
+        conn.execute("create table notes (body text)")
+        conn.commit()
+        conn.close()
+        junk = self.dir / "junk.backup"
+        junk.write_bytes(b"this is not a database at all")
+        for wrong in (other, junk):
+            code, _, err = self.cli("restore", str(wrong), "--yes")
+            self.assertEqual(code, 1)
+            self.assertIn("is not a backup of a sticker library", err)
+            self.assertEqual(self.counts(), (1, 7))
+
+    def test_restore_never_offers_another_library_its_backups(self):
+        make_store(self.db)
+        other = self.dir / "other.stickerdb"
+        make_store(other)
+        seed_sticker(other, 1, 1024)
+        imsticker.backup_db(other, self.backups)  # a newer backup, but of a different library
+        code, _, err = self.cli("restore", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("No backups of this library", err)
+        self.assertEqual(self.counts(), (0, 0))
+
+    def test_a_backup_that_fails_leaves_nothing_behind(self):
+        broken = self.dir / "broken.stickerdb"
+        broken.write_bytes(b"not a database, so the copy cannot be made" * 40)
+        with self.assertRaises(imsticker.ToolError) as caught:
+            imsticker.backup_db(broken, self.backups)
+        self.assertIn("nothing was changed", str(caught.exception))
+        self.assertEqual(list(self.backups.iterdir()), [])
 
     def test_restore_asks_first(self):
         make_store(self.db)
@@ -449,7 +503,7 @@ class BackupRestore(StoreCase):
         make_store(self.db)
         code, _, err = self.cli("restore", "--yes")
         self.assertEqual(code, 1)
-        self.assertIn("No backups found", err)
+        self.assertIn("No backups of this library", err)
 
 
 class ReadBack(StoreCase):

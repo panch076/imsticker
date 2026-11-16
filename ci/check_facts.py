@@ -41,7 +41,8 @@ def fit(width, height, edge, upscale):
 
 
 def even(size):
-    return tuple(max(2, side - side % 2) for side in size)
+    """An animation's canvas: an odd side is padded by one transparent pixel."""
+    return tuple(side + side % 2 for side in size)
 
 
 class Report:
